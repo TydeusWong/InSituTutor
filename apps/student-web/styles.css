@@ -1,0 +1,93 @@
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  background: #f4f7fb;
+  color: #1d2433;
+}
+
+.container {
+  width: min(920px, 92vw);
+  margin: 28px auto 40px;
+}
+
+.page-header h1 {
+  margin: 0;
+  font-size: 28px;
+}
+
+.meta-text {
+  margin-top: 8px;
+  color: #4a5d78;
+}
+
+.card {
+  background: #fff;
+  border: 1px solid #dbe3ef;
+  border-radius: 14px;
+  padding: 18px 20px;
+  box-shadow: 0 4px 10px rgba(19, 38, 63, 0.05);
+}
+
+.progress-line {
+  margin: 14px 0 10px;
+  font-weight: 600;
+  color: #1f4a9a;
+}
+
+.subtle {
+  color: #5e6f87;
+  margin-top: 6px;
+}
+
+.block {
+  margin-top: 14px;
+}
+
+.block h3 {
+  margin: 0 0 8px;
+  font-size: 16px;
+}
+
+ul {
+  margin: 0;
+  padding-left: 20px;
+}
+
+li + li {
+  margin-top: 6px;
+}
+
+.actions {
+  margin-top: 14px;
+}
+
+button {
+  border: none;
+  border-radius: 10px;
+  background: #2f6ce5;
+  color: #fff;
+  padding: 10px 18px;
+  font-size: 15px;
+  cursor: pointer;
+}
+
+button:hover {
+  background: #2456b8;
+}
+
+.hint {
+  margin-top: 10px;
+  color: #6f5a16;
+  background: #fff9e6;
+  border: 1px solid #f0df9d;
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+
+.hidden {
+  display: none;
+}

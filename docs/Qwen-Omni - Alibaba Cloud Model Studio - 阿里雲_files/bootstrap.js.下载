@@ -1,0 +1,1 @@
+define({load:function(a,b,c,d){var e="kloud/vendor/bootstrap/js/"+a,f={};f[e]={deps:["jquery"],exports:"$.fn."+a},require.config({shim:f}),b(["jquery",e],function(a,b){c(a)})}});

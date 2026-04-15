@@ -1,0 +1,338 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://insitututor.local/schemas/teaching_knowledge.schema.json",
+  "title": "TeachingKnowledge",
+  "type": "object",
+  "required": [
+    "task",
+    "steps",
+    "error_catalog",
+    "intervention_policies",
+    "runtime_rules",
+    "meta"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "task": {
+      "type": "object",
+      "required": [
+        "task_id",
+        "task_name",
+        "environment",
+        "required_objects",
+        "safety_notes"
+      ],
+      "additionalProperties": true,
+      "properties": {
+        "task_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "task_name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "environment": {
+          "type": "string"
+        },
+        "required_objects": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "safety_notes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "difficulty_level": {
+          "type": "string"
+        },
+        "language": {
+          "type": "string"
+        }
+      }
+    },
+    "steps": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": [
+          "step_id",
+          "step_order",
+          "step_name",
+          "goal",
+          "actions",
+          "attention_cues",
+          "completion_criteria"
+        ],
+        "additionalProperties": true,
+        "properties": {
+          "step_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "step_order": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "step_name": {
+            "type": "string",
+            "minLength": 1
+          },
+          "goal": {
+            "type": "string"
+          },
+          "preconditions": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "expected_duration_sec": {
+            "type": "number",
+            "minimum": 0
+          },
+          "actions": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "required": [
+                "action_id",
+                "action_name"
+              ],
+              "additionalProperties": true,
+              "properties": {
+                "action_id": {
+                  "type": "string"
+                },
+                "action_name": {
+                  "type": "string"
+                },
+                "body_part": {
+                  "type": [
+                    "array",
+                    "string"
+                  ]
+                },
+                "object": {
+                  "type": "string"
+                },
+                "pose_hint": {
+                  "type": "string"
+                },
+                "relative_position": {
+                  "type": "string"
+                },
+                "success_criteria": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          },
+          "attention_cues": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "required": [
+                "cue_id",
+                "cue_type",
+                "description"
+              ],
+              "additionalProperties": true,
+              "properties": {
+                "cue_id": {
+                  "type": "string"
+                },
+                "cue_type": {
+                  "type": "string"
+                },
+                "description": {
+                  "type": "string"
+                },
+                "source": {
+                  "type": "string"
+                },
+                "confidence_threshold": {
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1
+                }
+              }
+            }
+          },
+          "completion_criteria": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "string"
+            }
+          },
+          "next_step_hint": {
+            "type": "string"
+          },
+          "common_mistake_warning": {
+            "type": "string"
+          },
+          "if_error_then_intervention": {
+            "type": "string"
+          },
+          "timeout_hint_sec": {
+            "type": "number",
+            "minimum": 0
+          }
+        }
+      }
+    },
+    "error_catalog": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "error_id",
+          "step_id",
+          "error_pattern",
+          "trigger_condition",
+          "severity",
+          "intervention_id"
+        ],
+        "additionalProperties": true,
+        "properties": {
+          "error_id": {
+            "type": "string"
+          },
+          "step_id": {
+            "type": "string"
+          },
+          "error_pattern": {
+            "type": "string"
+          },
+          "trigger_condition": {
+            "type": "string"
+          },
+          "severity": {
+            "type": "string",
+            "enum": [
+              "low",
+              "medium",
+              "high"
+            ]
+          },
+          "intervention_id": {
+            "type": "string"
+          },
+          "fallback_action": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "intervention_policies": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "intervention_id",
+          "message"
+        ],
+        "additionalProperties": true,
+        "properties": {
+          "intervention_id": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "channel": {
+            "type": "string"
+          },
+          "cooldown_sec": {
+            "type": "number",
+            "minimum": 0
+          },
+          "max_repeat": {
+            "type": "integer",
+            "minimum": 1
+          }
+        }
+      }
+    },
+    "runtime_rules": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "rule_id",
+          "rule_type",
+          "step_id",
+          "simple_rule",
+          "on_trigger"
+        ],
+        "additionalProperties": true,
+        "properties": {
+          "rule_id": {
+            "type": "string"
+          },
+          "rule_type": {
+            "type": "string",
+            "enum": [
+              "sequence",
+              "presence",
+              "pose",
+              "spatial",
+              "timeout"
+            ]
+          },
+          "step_id": {
+            "type": "string"
+          },
+          "simple_rule": {
+            "type": "object"
+          },
+          "on_trigger": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "meta": {
+      "type": "object",
+      "required": [
+        "source_model",
+        "source_videos"
+      ],
+      "additionalProperties": true,
+      "properties": {
+        "source_model": {
+          "type": "string"
+        },
+        "source_videos": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "analysis_version": {
+          "type": "string"
+        },
+        "created_at": {
+          "type": "string"
+        },
+        "review_status": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}
