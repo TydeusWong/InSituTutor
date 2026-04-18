@@ -31,6 +31,12 @@ VI_VIDEO_MAX_MB = 50
 VI_INPUT_MANIFEST_PATH = ROOT / "data" / "raw" / "demo_manifest.json"
 VI_OUTPUT_MANIFEST_PATH = ROOT / "data" / "processed" / "ingest_manifest.json"
 
+# Pipeline A v2 constants
+V2_SEGMENTATION_OUTPUT_PATH = ROOT / "data" / "processed" / "v2" / "segmentation" / "sections_units.json"
+V2_STRATEGY_OUTPUT_DIR = ROOT / "data" / "processed" / "v2" / "strategy"
+V2_STRATEGY_OUTPUT_PATH = V2_STRATEGY_OUTPUT_DIR / "teaching_strategy_v2.json"
+V2_SEGMENTATION_PROMPT_DIR = ROOT / "models" / "prompts"
+
 
 def load_env_file() -> None:
     if not ENV_PATH.exists():

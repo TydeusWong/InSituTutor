@@ -1,0 +1,48 @@
+﻿{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://insitututor.local/schemas/teaching_strategy_v2.schema.json",
+  "title": "TeachingStrategyV2",
+  "type": "object",
+  "required": ["task", "sections", "meta"],
+  "properties": {
+    "task": {"type": "object"},
+    "sections": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["section_id", "section_name", "section_goal", "expected_section_state", "time_range"],
+        "properties": {
+          "section_id": {"type": "string"},
+          "section_name": {"type": "string"},
+          "section_goal": {"type": "string"},
+          "expected_section_state": {"type": "object"},
+          "time_range": {
+            "type": "object",
+            "required": ["start_sec", "end_sec"],
+            "properties": {
+              "start_sec": {"type": "number"},
+              "end_sec": {"type": "number"}
+            }
+          },
+          "atomic_units": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["unit_id", "time_range", "evidence", "class"],
+              "properties": {
+                "unit_id": {"type": "string"},
+                "time_range": {"type": "object"},
+                "evidence": {"type": "object"},
+                "class": {"type": "string", "enum": ["step", "error", "not_related"]}
+              }
+            }
+          },
+          "steps": {"type": "array", "items": {"type": "object"}},
+          "errors": {"type": "array", "items": {"type": "object"}}
+        }
+      }
+    },
+    "detector_registry": {"type": "array", "items": {"type": "object"}},
+    "meta": {"type": "object"}
+  }
+}
