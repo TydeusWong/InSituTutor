@@ -1,0 +1,61 @@
+{
+  "version": "v1",
+  "frozen_at": "2026-04-19T00:00:00+00:00",
+  "models": [
+    {
+      "id": "mediapipe-pose-landmarker",
+      "task": "pose_recognition",
+      "family": "MediaPipe Pose Landmarker",
+      "runtime": ["cpu", "gpu"],
+      "adapter": "adapters.mediapipe_pose.MediaPipePoseAdapter"
+    },
+    {
+      "id": "mediapipe-hand-landmarker",
+      "task": "hand_recognition",
+      "family": "MediaPipe Hand Landmarker",
+      "runtime": ["cpu", "gpu"],
+      "adapter": "adapters.mediapipe_hand.MediaPipeHandAdapter"
+    },
+    {
+      "id": "grounding-dino",
+      "task": "object_localization",
+      "family": "Grounding DINO",
+      "runtime": ["cpu", "gpu"],
+      "adapter": "adapters.grounding_dino.GroundingDINOAdapter"
+    },
+    {
+      "id": "yolo",
+      "task": "object_localization",
+      "family": "YOLO",
+      "runtime": ["cpu", "gpu"],
+      "adapter": "adapters.yolo.YOLOAdapter"
+    },
+    {
+      "id": "opencv-color",
+      "task": "color_recognition",
+      "family": "OpenCV",
+      "runtime": ["cpu"],
+      "adapter": "adapters.opencv_color.OpenCVColorAdapter"
+    }
+  ],
+  "io_contract": {
+    "input": {
+      "frame_bgr": "numpy.ndarray(H,W,3)",
+      "timestamp_sec": "float",
+      "frame_index": "int",
+      "context": "dict"
+    },
+    "output": {
+      "model_name": "str",
+      "features": "dict",
+      "confidence": "float[0,1]",
+      "latency_ms": "float",
+      "raw": "dict"
+    }
+  },
+  "default_thresholds": {
+    "min_confidence": 0.5,
+    "iou_match": 0.5,
+    "temporal_stability_frames": 3
+  }
+}

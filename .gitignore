@@ -3,5 +3,7 @@ __pycache__/
 *.pyc
 data/
 TODOlist.md
-TODOlist02.md
+TODOlist_02.md
 tests/
+docs/
+yolo11n.pt

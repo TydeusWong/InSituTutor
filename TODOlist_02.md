@@ -75,12 +75,12 @@
   - 恢复动作
 
 ### 2.4 小模型列表与运行环境（先于 detector_plan）
-- [ ] 冻结小模型列表（v1）：
+- [x] 冻结小模型列表（v1）：
   - 姿态识别：`MediaPipe Pose Landmarker`
   - 手部识别：`MediaPipe Hand Landmarker`
   - 物体位置识别：`Grounding DINO` / `YOLO`
   - 物体颜色识别：`OpenCV`
-- [ ] 设计并落地小模型目录结构（保持架构整齐、可读）：
+- [x] 设计并落地小模型目录结构（保持架构整齐、可读）：
   - `models/small-models/pose/mediapipe-pose-landmarker/`
   - `models/small-models/hand/mediapipe-hand-landmarker/`
   - `models/small-models/object/grounding-dino/`
@@ -88,65 +88,72 @@
   - `models/small-models/color/opencv/`
   - `services/criteria-trainer/adapters/`（统一推理适配层）
   - `services/criteria-trainer/configs/`（模型配置与阈值）
-- [ ] 完成环境初始化与依赖校验：
+- [x] 完成环境初始化与依赖校验：
   - 模型依赖安装脚本
   - GPU/CPU 运行能力检测
   - 统一 I/O 接口约定（输入帧、输出特征、置信度）
   - `healthcheck` 脚本（逐模型可用性）
 
 ### 2.5 按 step/error 时间切片
-- [ ] 基于 `sections_units.json` 与 `teaching_strategy_v2.json`，按每个 step/error 的 `time_range` 切片
-- [ ] 输出切片数据集（建议）：
+- [x] 基于 `sections_units.json` 与 `teaching_strategy_v2.json`，按每个 step/error 的 `time_range` 切片
+- [x] 输出切片数据集（建议）：
   - `data/<case_id>/v2/slices/<section_id>/<step_or_error_id>/clip.mp4`
   - `data/<case_id>/v2/slices/index.json`
-- [ ] 每个切片附带上下文元信息：
+- [x] 每个切片附带上下文元信息：
   - 所属 section 基本信息
   - 该 step/error 基本信息
   - 全视频 summary（来自 `video_overview.summary`）
 
-### 2.6 Omni 检测策略决策（先只尝试发送第一个step步骤，避免浪费token）
-- [ ] 将“单个切片 + 全局 summary + section 信息 + step/error 信息 + 小模型列表”发送给 Omni
-- [ ] 让 Omni 产出该片段的模型选择结果：
-  - 应使用哪些小模型（可多选）
-  - 每个模型检测什么目标/特征
-  - 检测顺序与并行策略
-- [ ] 让 Omni 产出具体检测策略（结构化）：
-  - 特征定义
-  - 判定条件/阈值
-  - 融合逻辑（多模型）
-  - 失败回退策略
-- [ ] 输出文件：
-  - `data/<case_id>/v2/detector-plans/detector_plan_v2.json`
-  - （可选）`data/<case_id>/v2/detector-plans/<step_or_error_id>.json`
 ---
 
 ## 3. Pipeline B：判定标准训练与校验（离线）
 
-### 3.1 训练样本自动构建
-- [ ] 根据 step/error 的时间范围切出视频片段
-- [ ] 对每个目标对象调用 Grounding DINO 自动标注
-- [ ] 每类对象抽样 25-30 张高质量帧做训练集
-- [ ] 建立样本质检规则（框质量、遮挡、运动模糊）
+### 3.1 Omni 检测策略决策（先只尝试发送第一个step步骤，避免浪费token）
+- [x] 将“单个切片 + 全局 summary + section 信息 + step/error 信息 + 小模型列表”发送给 Omni
+- [x] 让 Omni 产出该片段的模型选择结果：
+  - 应使用哪些小模型（可多选）
+  - 每个模型检测什么目标/特征
+  - 检测顺序与并行策略
+- [x] 让 Omni 产出具体检测策略（结构化）：
+  - 判定条件代码（`judgement_conditions[*].code`）
+- [x] 输出文件：
+  - `data/<case_id>/v2/detector-plans/detector_plan_v2.json`
+  - （可选）`data/<case_id>/v2/detector-plans/<step_or_error_id>.json`
+- [x] 预定义 Grounding DINO 判定原语并固化文档（供后续直接引用代码）：
+  - 绝对位置：`abs_center_xy`、`abs_pos_distance`
+  - 相对位置：`rel_x`、`rel_y`、`rel_distance`
+  - Hand + DINO 关系：`hand_to_bbox_distance`、`hand_in_bbox`
+  - 配置文件：`services/criteria-trainer/configs/detection_condition_primitives_v1.json`
+- [x] detector_plan 输出规范收敛：
+  - `model_selection` 不含 `reason`
+  - 不输出 `pass_threshold`
+  - `features + constraints` 合并为 `judgement_conditions`
+  - `judgement_conditions[*].code` 必须为可直接执行的判定条件代码
 
-### 3.2 小模型训练
-- [ ] YOLO 训练（按对象类别/场景版本组织）
-- [ ] 姿态与手部特征抽取流程固定化（MediaPipe）
-- [ ] 颜色识别流程固定化（OpenCV，颜色空间/阈值配置）
-- [ ] 形成 `detector_registry`（模型版本、适用 step/error、输入输出）
+### 3.2 回放校验（先仅验证第一个 step，避免浪费时间）
+- [x] 使用该 step 的判定策略回放检测原示教视频（压缩后的）；一旦判定成功，立即结束程序，并返回“首次判定成功”的视频时间点（秒）。
+- [x] 考虑 DINO 推理较慢，回放检测时按“每秒采样 2 帧”执行。  
+      采样规则：若视频为 2n FPS，则取每秒第 1 帧和第 n+1 帧。
 
-### 3.3 判定标准编译
-- [ ] 将 `detector_plan` 编译为可执行规则图（RuleGraph）
-- [ ] 输出每个 step/error 的 `pass/fail` 判定器
-- [ ] 支持规则解释（失败原因、命中证据、阈值明细）
+### 3.3 对所有步骤执行Omni 检测策略决策
+- [x] 遍历 `data/<case_id>/v2/slices/index.json` 中所有 `slice_type=step` 的切片，逐个执行 2.6 的 Omni 决策流程（不再只限第一个 step）。
+- [x] 逐 step 执行时沿用同一输出规范：
+  - `model_selection` 不含 `reason`
+  - 不输出 `pass_threshold`
+  - 输出 `judgement_conditions[*].code`，且仅可调用 `detection_condition_primitives_v1.json` 中已定义原语
+  - 采用“最小可判定模型集”原则（非必要不增模型/实体）
+- [x] 执行策略：
+  - 默认串行（避免 token/并发开销过高）
+  - 支持断点续跑：已存在且合法的 `<step_id>.json` 可跳过
+  - 任一步失败时记录错误并继续后续 step，最终输出失败清单
+- [x] 输出文件：
+  - `data/<case_id>/v2/detector-plans/<step_id>.json`（每个 step 一个）
+  - `data/<case_id>/v2/detector-plans/detector_plan_v2.json`（聚合索引，含成功/失败统计）
+- [x] 完成后做一致性校验：
+  - `step` 总数 == 产出的 `<step_id>.json` 总数（减去失败清单）
+  - 每个结果文件均可被 `sanitize_detector_plan` 通过
+  - `judgement_conditions[*].code` 可被回放校验脚本直接引用
 
-### 3.4 离线回放校验（必须）
-- [ ] 用原示教视频回放每个 step/error
-- [ ] 校验项：
-  - step 通过率
-  - error 召回率
-  - 误报率
-  - 时间对齐误差
-- [ ] 达标后发布 `criteria_bundle_v2`
 
 ---
 
@@ -224,4 +231,6 @@
 - [ ] 新建 `services/strategy-builder`，先实现 JSON 拼装与校验
 - [ ] 设计 `detector_plan` DSL 的最小可用语法与示例
 - [ ] 准备一段示教视频做端到端离线小样验证
+
+
 

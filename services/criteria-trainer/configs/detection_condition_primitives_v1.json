@@ -1,0 +1,60 @@
+{
+  "version": "v1",
+  "generated_at": "2026-04-19T00:00:00+00:00",
+  "notes": "Primitive condition functions for directly executable judgement condition code.",
+  "grounding_dino": {
+    "absolute_position": [
+      {
+        "name": "abs_pos_distance",
+        "signature": "abs_pos_distance(object_id: str, anchor_id: str) -> float",
+        "returns": "normalized_distance_0_to_1",
+        "description": "Distance between object bbox center and an absolute anchor point (for example workspace_center)."
+      },
+      {
+        "name": "abs_center_xy",
+        "signature": "abs_center_xy(object_id: str) -> tuple[float, float]",
+        "returns": "normalized_xy_0_to_1",
+        "description": "Normalized center coordinates of object bbox."
+      }
+    ],
+    "relative_position": [
+      {
+        "name": "rel_x",
+        "signature": "rel_x(left_obj: str, right_obj: str) -> float",
+        "returns": "x_left_minus_x_right",
+        "description": "Signed x relation between two object centers. <0 means left_obj is left of right_obj."
+      },
+      {
+        "name": "rel_y",
+        "signature": "rel_y(top_obj: str, bottom_obj: str) -> float",
+        "returns": "y_top_minus_y_bottom",
+        "description": "Signed y relation between two object centers. <0 means top_obj is above bottom_obj."
+      },
+      {
+        "name": "rel_distance",
+        "signature": "rel_distance(obj_a: str, obj_b: str) -> float",
+        "returns": "normalized_distance_0_to_1",
+        "description": "Distance between centers of two objects."
+      }
+    ]
+  },
+  "hand_dino_relation": [
+    {
+      "name": "hand_to_bbox_distance",
+      "signature": "hand_to_bbox_distance(hand_point: str, object_id: str) -> float",
+      "returns": "normalized_distance_0_to_1",
+      "description": "Distance between a hand landmark point and an object bbox center."
+    },
+    {
+      "name": "hand_in_bbox",
+      "signature": "hand_in_bbox(hand_point: str, object_id: str) -> bool",
+      "returns": "boolean",
+      "description": "Whether the hand landmark point lies inside the object bbox."
+    }
+  ],
+  "code_examples": [
+    "abs_pos_distance('blue_box', 'workspace_center') <= 0.05",
+    "rel_x('blue_box', 'tape_roll') < 0 and rel_distance('blue_box', 'tape_roll') <= 0.25",
+    "hand_in_bbox('index_fingertip', 'blue_box')"
+  ]
+}

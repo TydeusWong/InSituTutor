@@ -1,0 +1,26 @@
+{
+  "pipeline_stage": "criteria-trainer:small-model-setup",
+  "generated_at": "2026-04-19T09:19:17.884918+00:00",
+  "created_dirs": [
+    "models\\small-models\\pose\\mediapipe-pose-landmarker",
+    "models\\small-models\\hand\\mediapipe-hand-landmarker",
+    "models\\small-models\\object\\grounding-dino",
+    "models\\small-models\\object\\yolo",
+    "models\\small-models\\color\\opencv"
+  ],
+  "runtime": {
+    "os": "Windows-10-10.0.26200-SP0",
+    "python": "3.11.5",
+    "ffmpeg_available": true,
+    "gpu": {
+      "torch_cuda": true,
+      "torch_device_count": 1,
+      "onnxruntime_cuda": false
+    }
+  },
+  "healthcheck": {
+    "exit_code": 0,
+    "stdout": "[OK] healthcheck report: C:\\Users\\27748\\Desktop\\InSituTutor\\services\\criteria-trainer\\configs\\healthcheck_report.json\n[OK] adapters checked: 5, failed: 3",
+    "stderr": ""
+  }
+}

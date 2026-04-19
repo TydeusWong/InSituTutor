@@ -1,0 +1,58 @@
+{
+  "pipeline_stage": "criteria-trainer:small-model-healthcheck",
+  "generated_at": "2026-04-19T10:22:28.899025+00:00",
+  "catalog_version": "v1",
+  "package_checks": {
+    "mediapipe": {
+      "ok": true,
+      "version": "0.10.33"
+    },
+    "opencv": {
+      "ok": true,
+      "version": "4.8.0"
+    },
+    "ultralytics": {
+      "ok": true,
+      "version": "8.4.39"
+    },
+    "torch": {
+      "ok": true,
+      "version": "2.5.1+cpu"
+    }
+  },
+  "adapter_checks": [
+    {
+      "model_id": "mediapipe-pose-landmarker",
+      "ok": true,
+      "model_name": "mediapipe-pose-landmarker"
+    },
+    {
+      "model_id": "mediapipe-hand-landmarker",
+      "ok": true,
+      "model_name": "mediapipe-hand-landmarker"
+    },
+    {
+      "model_id": "grounding-dino",
+      "ok": true,
+      "model_name": "grounding-dino"
+    },
+    {
+      "model_id": "yolo",
+      "ok": true,
+      "model_name": "yolo"
+    },
+    {
+      "model_id": "opencv-color",
+      "ok": true,
+      "model_name": "opencv-color"
+    }
+  ],
+  "runtime": {
+    "os": "Windows-10-10.0.26200-SP0",
+    "python": "3.10.13",
+    "ffmpeg_available": true,
+    "torch_cuda": false,
+    "torch_cuda_device_count": 0,
+    "onnxruntime_error": "DLL load failed while importing onnxruntime_pybind11_state: 动态链接库(DLL)初始化例程失败。"
+  }
+}
