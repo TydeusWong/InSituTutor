@@ -3,4 +3,5 @@ __pycache__/
 *.pyc
 data/
 TODOlist.md
+TODOlist02.md
 tests/

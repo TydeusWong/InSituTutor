@@ -9,10 +9,11 @@
 
 ## 预处理策略
 
-两阶段固定流程：
+三阶段固定流程：
 
 1. 先统一降到 `10fps`
-2. 如果结果仍大于 `VI_VIDEO_MAX_MB`，再做画质/码率压缩
+2. 如果分辨率高于 `720p`，先压到 `720p`
+3. 如果结果仍大于 `VI_VIDEO_MAX_MB`，再做码率压缩
 
 压缩阶段：
 
@@ -54,6 +55,7 @@ python services/video-ingest/preprocess_video.py --video "data/raw/your_demo.mp4
 - `ingest_status`：`ready` 或 `ready_remote`
 - `source_video_path`：原始输入路径（仅追溯用）
 - `fps`：预处理后的视频帧率（本地视频会自动写入，通常为 `10.0`）
+- `video_bitrate_kbps`：预处理后视频码率（kbps）
 
 说明：
 

@@ -180,16 +180,20 @@ def mock_sections(item: Dict[str, Any]) -> Dict[str, Any]:
     mid = max(10.0, duration * 0.5)
     end = max(mid + 10.0, duration)
     return {
+        "video_overview": {
+            "summary": "该视频演示了目标物体摆放与收尾确认流程。",
+            "total_sections": 2,
+            "section_atomic_counts": [
+                {"section_ref": "section_01", "atomic_unit_count": 3},
+                {"section_ref": "section_02", "atomic_unit_count": 1},
+            ],
+        },
         "sections": [
             {
                 "section_id": "section_01",
                 "section_name": "准备与定位",
                 "section_summary": "准备关键物体并完成目标对齐。",
-                "expected_section_state": {
-                    "object_relations": [
-                        {"subject": "black_can", "predicate": "above", "object": "transparent_tape"}
-                    ]
-                },
+                "expected_section_state": "黑色罐子稳定放置在透明胶带上方并保持可见。",
                 "time_range": {"start_sec": 0.0, "end_sec": round(mid, 2)},
                 "atomic_units": [
                     {
@@ -202,14 +206,12 @@ def mock_sections(item: Dict[str, Any]) -> Dict[str, Any]:
                             "vision": ["hand_grasp(black_can)", "above(black_can,transparent_tape)"]
                         },
                         "step_fields": {
-                            "prompt": "请把黑色罐子放到透明胶带上方。",
+                            "prompt": {
+                                "en": "Place the black can above the transparent tape.",
+                                "zh": "请把黑色罐子放到透明胶带上方。"
+                            },
                             "focus_points": ["先稳定抓握", "对齐目标中心"],
                             "common_mistakes": ["放在胶带旁边"],
-                            "expected_post_state": {
-                                "relations": [
-                                    {"subject": "black_can", "predicate": "above", "object": "transparent_tape"}
-                                ]
-                            }
                         },
                         "error_fields": {},
                     },
@@ -244,11 +246,7 @@ def mock_sections(item: Dict[str, Any]) -> Dict[str, Any]:
                 "section_id": "section_02",
                 "section_name": "确认与收尾",
                 "section_summary": "确认物体关系保持稳定。",
-                "expected_section_state": {
-                    "object_relations": [
-                        {"subject": "black_can", "predicate": "stable_above", "object": "transparent_tape"}
-                    ]
-                },
+                "expected_section_state": "黑色罐子在透明胶带上方位置稳定且无遮挡。",
                 "time_range": {"start_sec": round(mid, 2), "end_sec": round(end, 2)},
                 "atomic_units": [
                     {
@@ -261,12 +259,12 @@ def mock_sections(item: Dict[str, Any]) -> Dict[str, Any]:
                             "vision": ["stable(black_can)"]
                         },
                         "step_fields": {
-                            "prompt": "确认黑色罐子稳定位于透明胶带上方。",
+                            "prompt": {
+                                "en": "Confirm the black can is stably above the transparent tape.",
+                                "zh": "确认黑色罐子稳定位于透明胶带上方。"
+                            },
                             "focus_points": ["观察抖动", "检查遮挡"],
                             "common_mistakes": ["确认过早"],
-                            "expected_post_state": {
-                                "stability": "ok"
-                            }
                         },
                         "error_fields": {},
                     }
@@ -319,10 +317,14 @@ def main() -> None:
             user_prompt = build_user_prompt(
                 user_template,
                 {
-                    "task_name": item.get("task_name", "unknown_task"),
-                    "environment": item.get("environment", "default_space"),
+                    "task_id": item.get("task_id", "unknown_task"),
                     "video_id": item.get("video_id", "unknown_video"),
                     "duration_sec": item.get("ingest_duration_sec", 0),
+                    "fps": item.get("fps", "unknown"),
+                    "resolution": item.get("resolution", "unknown"),
+                    "video_quality": item.get("video_quality", "unknown"),
+                    "video_bitrate_kbps": item.get("video_bitrate_kbps", "unknown"),
+                    "source_audio_quality": item.get("source_audio_quality", "unknown"),
                     "scene_tags": ",".join(item.get("scene_tags", [])) if isinstance(item.get("scene_tags"), list) else "",
                 },
             )
@@ -340,11 +342,14 @@ def main() -> None:
         out["demos"].append(
             {
                 "task_id": item.get("task_id", "task-demo"),
-                "task_name": item.get("task_name", "demo task"),
-                "environment": item.get("environment", "default_space"),
                 "video_id": item.get("video_id", "unknown_video"),
                 "scene_tags": item.get("scene_tags", []),
                 "source_audio_quality": item.get("source_audio_quality", "unknown"),
+                "fps": item.get("fps", "unknown"),
+                "resolution": item.get("resolution", "unknown"),
+                "video_quality": item.get("video_quality", "unknown"),
+                "video_bitrate_kbps": item.get("video_bitrate_kbps", "unknown"),
+                "video_overview": parsed.get("video_overview", {}),
                 "sections": parsed.get("sections", []),
             }
         )

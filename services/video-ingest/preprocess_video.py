@@ -166,6 +166,89 @@ def probe_fps(path: Path) -> float:
     return 0.0
 
 
+def probe_resolution(path: Path) -> tuple[int, int]:
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=width,height",
+        "-of",
+        "csv=p=0:s=x",
+        str(path),
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        return (0, 0)
+    raw = proc.stdout.strip()
+    if "x" not in raw:
+        return (0, 0)
+    left, right = raw.split("x", 1)
+    try:
+        w = int(left.strip())
+        h = int(right.strip())
+        return (w, h)
+    except ValueError:
+        return (0, 0)
+
+
+def probe_video_bitrate_kbps(path: Path) -> float:
+    # Prefer video stream bitrate; fallback to container bitrate if unavailable.
+    stream_cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=bit_rate",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        str(path),
+    ]
+    proc = subprocess.run(stream_cmd, capture_output=True, text=True)
+    if proc.returncode == 0:
+        raw = proc.stdout.strip()
+        if raw.isdigit():
+            return round(int(raw) / 1000.0, 3)
+
+    format_cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "format=bit_rate",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        str(path),
+    ]
+    proc2 = subprocess.run(format_cmd, capture_output=True, text=True)
+    if proc2.returncode == 0:
+        raw = proc2.stdout.strip()
+        if raw.isdigit():
+            return round(int(raw) / 1000.0, 3)
+    return 0.0
+
+
+def to_quality_label(width: int, height: int) -> str:
+    if width <= 0 or height <= 0:
+        return "unknown"
+    h = min(width, height)
+    if h >= 2160:
+        return "2160p"
+    if h >= 1440:
+        return "1440p"
+    if h >= 1080:
+        return "1080p"
+    if h >= 720:
+        return "720p"
+    if h >= 480:
+        return "480p"
+    return "unknown"
+
+
 def run_ffmpeg_force_fps(src: Path, dst: Path, target_fps: int = 10) -> None:
     if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
         raise RuntimeError("ffmpeg/ffprobe not found in PATH.")
@@ -190,6 +273,34 @@ def run_ffmpeg_force_fps(src: Path, dst: Path, target_fps: int = 10) -> None:
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0:
         raise RuntimeError(f"ffmpeg force-fps failed: {proc.stderr.strip()[:800]}")
+
+
+def run_ffmpeg_scale_to_720p(src: Path, dst: Path) -> None:
+    if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+        raise RuntimeError("ffmpeg/ffprobe not found in PATH.")
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    # Keep aspect ratio and make dimensions even.
+    scale_filter = "scale='if(gte(iw,ih),-2,720)':'if(gte(iw,ih),720,-2)'"
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(src),
+        "-vf",
+        scale_filter,
+        "-c:v",
+        "libx264",
+        "-crf",
+        "18",
+        "-preset",
+        "medium",
+        "-c:a",
+        "copy",
+        str(dst),
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise RuntimeError(f"ffmpeg 720p scaling failed: {proc.stderr.strip()[:800]}")
 
 
 def run_ffmpeg_compress_video_only(src: Path, dst: Path, target_mb: int, ratio: float = 0.95) -> None:
@@ -235,16 +346,24 @@ def preprocess_video_if_needed(video_path: Path, max_mb: Optional[int] = None, o
     # Stage 1: force output fps to 10
     run_ffmpeg_force_fps(video_path, fps_path, target_fps=10)
 
-    size_mb = get_file_size_mb(fps_path)
-    if size_mb <= max_mb:
-        return fps_path
+    # Stage 2: if higher than 720p, downscale to 720p
+    w, h = probe_resolution(fps_path)
+    quality_path = fps_path
+    if min(w, h) > 720:
+        scaled_path = out_dir / f"{video_path.stem}_fps10_720p.mp4"
+        run_ffmpeg_scale_to_720p(fps_path, scaled_path)
+        quality_path = scaled_path
 
-    # Stage 2: if still too large, reduce video quality/bitrate
-    out_path = out_dir / f"{video_path.stem}_fps10_compressed_{max_mb}mb.mp4"
+    size_mb = get_file_size_mb(quality_path)
+    if size_mb <= max_mb:
+        return quality_path
+
+    # Stage 3: if still too large, reduce video bitrate
+    out_path = out_dir / f"{video_path.stem}_fps10_720p_compressed_{max_mb}mb.mp4"
     ratios = [0.95, 0.85, 0.75, 0.65, 0.55]
     new_size = size_mb
     for ratio in ratios:
-        run_ffmpeg_compress_video_only(fps_path, out_path, max_mb, ratio=ratio)
+        run_ffmpeg_compress_video_only(quality_path, out_path, max_mb, ratio=ratio)
         new_size = get_file_size_mb(out_path)
         if new_size <= max_mb:
             return out_path
@@ -264,7 +383,12 @@ def build_ingest_item(item: Dict[str, Any], max_mb: int, out_dir: Path) -> Dict[
         out_item["ingest_video_path"] = to_rel_or_abs(processed_path)
         out_item["ingest_duration_sec"] = probe_duration_sec(processed_path)
         measured_fps = probe_fps(processed_path)
+        measured_bitrate_kbps = probe_video_bitrate_kbps(processed_path)
+        width, height = probe_resolution(processed_path)
         out_item["fps"] = round(measured_fps, 3) if measured_fps > 0 else "unknown"
+        out_item["video_bitrate_kbps"] = measured_bitrate_kbps if measured_bitrate_kbps > 0 else "unknown"
+        out_item["resolution"] = f"{width}x{height}" if width > 0 and height > 0 else "unknown"
+        out_item["video_quality"] = to_quality_label(width, height)
         out_item["source_video_path"] = video_path
         out_item["ingest_status"] = "ready"
         out_item["ingest_fingerprint"] = sha256_file(processed_path)
@@ -279,6 +403,9 @@ def build_ingest_item(item: Dict[str, Any], max_mb: int, out_dir: Path) -> Dict[
         out_item["ingest_status"] = "ready_remote"
         out_item["ingest_video_uri"] = video_uri
         out_item["fps"] = out_item.get("fps", "unknown")
+        out_item["video_bitrate_kbps"] = out_item.get("video_bitrate_kbps", "unknown")
+        out_item["resolution"] = out_item.get("resolution", "unknown")
+        out_item["video_quality"] = out_item.get("video_quality", "unknown")
         out_item["ingest_fingerprint"] = hashlib.sha256(video_uri.encode("utf-8")).hexdigest()
         out_item["source_audio_quality"] = str(out_item.get("source_audio_quality") or "unknown")
         out_item["scene_tags"] = build_scene_tags(out_item, environment)
@@ -307,6 +434,8 @@ def build_single_video_manifest(
     video_id: str,
 ) -> Dict[str, Any]:
     measured_fps = probe_fps(processed_path)
+    measured_bitrate_kbps = probe_video_bitrate_kbps(processed_path)
+    width, height = probe_resolution(processed_path)
     return {
         "pipeline_stage": "video-ingest",
         "generated_at": utc_now_iso(),
@@ -315,6 +444,9 @@ def build_single_video_manifest(
                 "task_id": task_id,
                 "video_id": video_id,
                 "fps": round(measured_fps, 3) if measured_fps > 0 else "unknown",
+                "video_bitrate_kbps": measured_bitrate_kbps if measured_bitrate_kbps > 0 else "unknown",
+                "resolution": f"{width}x{height}" if width > 0 and height > 0 else "unknown",
+                "video_quality": to_quality_label(width, height),
                 "ingest_video_path": to_rel_or_abs(processed_path),
                 "ingest_duration_sec": probe_duration_sec(processed_path),
                 "ingest_status": "ready",

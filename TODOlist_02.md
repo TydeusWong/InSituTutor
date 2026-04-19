@@ -1,4 +1,4 @@
-# InSituTutor 重构 TODO List v0.2（TODOlist_02）
+﻿# InSituTutor 重构 TODO List v0.2（TODOlist_02）
 
 ## 0. 重构目标与边界（先冻结）
 
@@ -73,20 +73,51 @@
   - 触发描述
   - 纠错提示
   - 恢复动作
-- [x] 生成 section 内 step/error 顺序图与依赖关系
 
-### 2.4 检测器规划（从自然语言到程序化）
-- [ ] 为每个 step/error 生成 `detector_plan`：
-  - 需要哪些小模型（MediaPipe / Hand Landmark / Grounding DINO/yolo11n / OpenCV）
-  - 每个模型输出哪些特征
-  - 如何组合成数学/逻辑判定
-- [ ] 定义统一 DSL（建议）：
-  - 时序谓词：`before/after/within`
-  - 空间谓词：`overlap/iou/above/left_of/distance`
-  - 动作谓词：`grasp/release/move_to`
-  - 置信度聚合：`weighted_score >= threshold`
-- [ ] 产出文件：`teaching_strategy_v2.json`
+### 2.4 小模型列表与运行环境（先于 detector_plan）
+- [ ] 冻结小模型列表（v1）：
+  - 姿态识别：`MediaPipe Pose Landmarker`
+  - 手部识别：`MediaPipe Hand Landmarker`
+  - 物体位置识别：`Grounding DINO` / `YOLO`
+  - 物体颜色识别：`OpenCV`
+- [ ] 设计并落地小模型目录结构（保持架构整齐、可读）：
+  - `models/small-models/pose/mediapipe-pose-landmarker/`
+  - `models/small-models/hand/mediapipe-hand-landmarker/`
+  - `models/small-models/object/grounding-dino/`
+  - `models/small-models/object/yolo/`
+  - `models/small-models/color/opencv/`
+  - `services/criteria-trainer/adapters/`（统一推理适配层）
+  - `services/criteria-trainer/configs/`（模型配置与阈值）
+- [ ] 完成环境初始化与依赖校验：
+  - 模型依赖安装脚本
+  - GPU/CPU 运行能力检测
+  - 统一 I/O 接口约定（输入帧、输出特征、置信度）
+  - `healthcheck` 脚本（逐模型可用性）
 
+### 2.5 按 step/error 时间切片
+- [ ] 基于 `sections_units.json` 与 `teaching_strategy_v2.json`，按每个 step/error 的 `time_range` 切片
+- [ ] 输出切片数据集（建议）：
+  - `data/<case_id>/v2/slices/<section_id>/<step_or_error_id>/clip.mp4`
+  - `data/<case_id>/v2/slices/index.json`
+- [ ] 每个切片附带上下文元信息：
+  - 所属 section 基本信息
+  - 该 step/error 基本信息
+  - 全视频 summary（来自 `video_overview.summary`）
+
+### 2.6 Omni 检测策略决策（先只尝试发送第一个step步骤，避免浪费token）
+- [ ] 将“单个切片 + 全局 summary + section 信息 + step/error 信息 + 小模型列表”发送给 Omni
+- [ ] 让 Omni 产出该片段的模型选择结果：
+  - 应使用哪些小模型（可多选）
+  - 每个模型检测什么目标/特征
+  - 检测顺序与并行策略
+- [ ] 让 Omni 产出具体检测策略（结构化）：
+  - 特征定义
+  - 判定条件/阈值
+  - 融合逻辑（多模型）
+  - 失败回退策略
+- [ ] 输出文件：
+  - `data/<case_id>/v2/detector-plans/detector_plan_v2.json`
+  - （可选）`data/<case_id>/v2/detector-plans/<step_or_error_id>.json`
 ---
 
 ## 3. Pipeline B：判定标准训练与校验（离线）
@@ -193,3 +224,4 @@
 - [ ] 新建 `services/strategy-builder`，先实现 JSON 拼装与校验
 - [ ] 设计 `detector_plan` DSL 的最小可用语法与示例
 - [ ] 准备一段示教视频做端到端离线小样验证
+
