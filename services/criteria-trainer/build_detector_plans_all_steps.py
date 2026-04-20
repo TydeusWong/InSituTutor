@@ -75,7 +75,7 @@ def build_detector_user_payload(target_slice: Dict[str, Any], small_models: Dict
             "slice_id": "string",
             "slice_type": "step|error",
             "models_required": ["string"],
-            "model_selection": [{"model_id": "string", "detect_target": "string"}],
+            "model_selection": [{"model_id": "string", "detect_targets": ["string"]}],
             "execution_plan": {"order": ["string"], "parallel_groups": [["string"]]},
             "judgement_conditions": [
                 {
@@ -98,7 +98,52 @@ def sanitize_detector_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
         "execution_plan",
         "judgement_conditions",
     }
-    return {k: v for k, v in plan.items() if k in allowed}
+    cleaned = {k: v for k, v in plan.items() if k in allowed}
+    model_selection = cleaned.get("model_selection")
+    if isinstance(model_selection, list):
+        agg: Dict[str, List[str]] = {}
+        for item in model_selection:
+            if not isinstance(item, dict):
+                continue
+            model_id = str(item.get("model_id", "")).strip()
+            if not model_id:
+                continue
+            targets: List[str] = []
+            if isinstance(item.get("detect_targets"), list):
+                targets = [str(x).strip() for x in item["detect_targets"] if str(x).strip()]
+            elif isinstance(item.get("detect_target"), str):
+                raw = item["detect_target"]
+                targets = [x.strip() for x in re.split(r",| and ", raw) if x.strip()]
+            agg.setdefault(model_id, [])
+            for t in targets:
+                if t not in agg[model_id]:
+                    agg[model_id].append(t)
+        cleaned["model_selection"] = [{"model_id": m, "detect_targets": ts} for m, ts in agg.items()]
+    return cleaned
+
+
+def extract_grounding_dino_targets(plan: Dict[str, Any]) -> List[str]:
+    targets: List[str] = []
+    model_selection = plan.get("model_selection", [])
+    if not isinstance(model_selection, list):
+        return targets
+    for item in model_selection:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("model_id", "")).strip() != "grounding-dino":
+            continue
+        raw_targets = item.get("detect_targets")
+        if isinstance(raw_targets, list):
+            for x in raw_targets:
+                t = str(x).strip()
+                if t and t not in targets:
+                    targets.append(t)
+        elif isinstance(item.get("detect_target"), str):
+            for x in re.split(r",| and ", item["detect_target"]):
+                t = x.strip()
+                if t and t not in targets:
+                    targets.append(t)
+    return targets
 
 
 def extract_primitive_names(primitives: Dict[str, Any]) -> Set[str]:
@@ -139,6 +184,24 @@ def validate_plan(plan: Dict[str, Any], primitive_names: Set[str]) -> Tuple[bool
         return False, f"missing keys: {', '.join(missing)}"
     if not isinstance(plan.get("judgement_conditions"), list) or not plan["judgement_conditions"]:
         return False, "judgement_conditions must be non-empty list"
+    if not isinstance(plan.get("model_selection"), list) or not plan["model_selection"]:
+        return False, "model_selection must be non-empty list"
+    seen_model_ids: Set[str] = set()
+    for idx, item in enumerate(plan["model_selection"]):
+        if not isinstance(item, dict):
+            return False, f"model_selection[{idx}] must be object"
+        model_id = str(item.get("model_id", "")).strip()
+        if not model_id:
+            return False, f"model_selection[{idx}].model_id is empty"
+        if model_id in seen_model_ids:
+            return False, f"duplicated model_id in model_selection: {model_id}"
+        seen_model_ids.add(model_id)
+        targets = item.get("detect_targets")
+        if not isinstance(targets, list) or not targets:
+            return False, f"model_selection[{idx}].detect_targets must be non-empty array"
+        dedup_targets = [str(t).strip() for t in targets if str(t).strip()]
+        if len(dedup_targets) != len(set(dedup_targets)):
+            return False, f"model_selection[{idx}].detect_targets contains duplicates"
     for idx, item in enumerate(plan["judgement_conditions"]):
         code = str(item.get("code", "")).strip() if isinstance(item, dict) else ""
         if not code:
@@ -280,6 +343,7 @@ def main() -> None:
     failures: List[Dict[str, Any]] = []
     all_sanitized = True
     all_codes_valid = True
+    grounding_dino_targets: Set[str] = set()
 
     for step in step_slices:
         slice_id = str(step.get("slice_id", "")).strip()
@@ -292,6 +356,8 @@ def main() -> None:
                 existing = sanitize_detector_plan(read_json(out_path))
                 ok, err = validate_plan(existing, primitive_names)
                 if ok:
+                    for t in extract_grounding_dino_targets(existing):
+                        grounding_dino_targets.add(t)
                     successes.append({"slice_id": slice_id, "status": "skipped_existing", "file": str(out_path)})
                     continue
             except Exception:
@@ -317,6 +383,8 @@ def main() -> None:
             if not ok:
                 all_codes_valid = False
                 raise RuntimeError(f"invalid plan: {err}")
+            for t in extract_grounding_dino_targets(plan):
+                grounding_dino_targets.add(t)
             write_json(out_path, plan)
             successes.append({"slice_id": slice_id, "status": "generated", "file": str(out_path)})
         except Exception as exc:
@@ -343,6 +411,7 @@ def main() -> None:
         "failed_count": failed_count,
         "successes": successes,
         "failures": failures,
+        "grounding_dino_detect_targets": sorted(grounding_dino_targets),
         "consistency_checks": consistency,
     }
     write_json(output_dir / "detector_plan_v2.json", aggregate)

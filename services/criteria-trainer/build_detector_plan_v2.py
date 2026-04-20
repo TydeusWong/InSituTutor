@@ -74,7 +74,7 @@ def build_detector_user_payload(target_slice: Dict[str, Any], small_models: Dict
             "slice_id": "string",
             "slice_type": "step|error",
             "models_required": ["string"],
-            "model_selection": [{"model_id": "string", "detect_target": "string"}],
+            "model_selection": [{"model_id": "string", "detect_targets": ["string"]}],
             "execution_plan": {"order": ["string"], "parallel_groups": [["string"]]},
             "judgement_conditions": [
                 {
@@ -97,7 +97,28 @@ def sanitize_detector_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
         "execution_plan",
         "judgement_conditions",
     }
-    return {k: v for k, v in plan.items() if k in allowed}
+    cleaned = {k: v for k, v in plan.items() if k in allowed}
+    model_selection = cleaned.get("model_selection")
+    if isinstance(model_selection, list):
+        agg: Dict[str, List[str]] = {}
+        for item in model_selection:
+            if not isinstance(item, dict):
+                continue
+            model_id = str(item.get("model_id", "")).strip()
+            if not model_id:
+                continue
+            targets: List[str] = []
+            if isinstance(item.get("detect_targets"), list):
+                targets = [str(x).strip() for x in item["detect_targets"] if str(x).strip()]
+            elif isinstance(item.get("detect_target"), str):
+                raw = item["detect_target"]
+                targets = [x.strip() for x in re.split(r",| and ", raw) if x.strip()]
+            agg.setdefault(model_id, [])
+            for t in targets:
+                if t not in agg[model_id]:
+                    agg[model_id].append(t)
+        cleaned["model_selection"] = [{"model_id": m, "detect_targets": ts} for m, ts in agg.items()]
+    return cleaned
 
 
 def build_mock_detector_plan(target_slice: Dict[str, Any], small_models: Dict[str, Any]) -> Dict[str, Any]:
@@ -110,7 +131,7 @@ def build_mock_detector_plan(target_slice: Dict[str, Any], small_models: Dict[st
         "model_selection": [
             {
                 "model_id": "grounding-dino",
-                "detect_target": "target object position",
+                "detect_targets": ["target object position"],
             }
         ],
         "execution_plan": {
