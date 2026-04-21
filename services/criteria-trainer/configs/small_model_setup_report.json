@@ -1,6 +1,6 @@
 {
   "pipeline_stage": "criteria-trainer:small-model-setup",
-  "generated_at": "2026-04-19T09:19:17.884918+00:00",
+  "generated_at": "2026-04-21T07:03:20.301775+00:00",
   "created_dirs": [
     "models\\small-models\\pose\\mediapipe-pose-landmarker",
     "models\\small-models\\hand\\mediapipe-hand-landmarker",
@@ -10,7 +10,7 @@
   ],
   "runtime": {
     "os": "Windows-10-10.0.26200-SP0",
-    "python": "3.11.5",
+    "python": "3.10.13",
     "ffmpeg_available": true,
     "gpu": {
       "torch_cuda": true,
@@ -20,7 +20,7 @@
   },
   "healthcheck": {
     "exit_code": 0,
-    "stdout": "[OK] healthcheck report: C:\\Users\\27748\\Desktop\\InSituTutor\\services\\criteria-trainer\\configs\\healthcheck_report.json\n[OK] adapters checked: 5, failed: 3",
-    "stderr": ""
+    "stdout": "[OK] healthcheck report: C:\\Users\\27748\\Desktop\\InSituTutor\\services\\criteria-trainer\\configs\\healthcheck_report.json\n[OK] adapters checked: 5, failed: 0",
+    "stderr": "INFO: Created TensorFlow Lite XNNPACK delegate for CPU.\nW0000 00:00:1776754992.555858   44696 inference_feedback_manager.cc:121] Feedback manager requires a model with a single signature inference. Disabling support for feedback tensors.\nW0000 00:00:1776754992.564564   44696 inference_feedback_manager.cc:121] Feedback manager requires a model with a single signature inference. Disabling support for feedback tensors."
   }
 }

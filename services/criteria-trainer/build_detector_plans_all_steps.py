@@ -60,15 +60,52 @@ def build_user_prompt(template: str, payload: Dict[str, Any]) -> str:
     return out
 
 
-def build_detector_user_payload(target_slice: Dict[str, Any], small_models: Dict[str, Any], condition_primitives: Dict[str, Any]) -> Dict[str, Any]:
+def normalize_name(value: Any) -> str:
+    return str(value).strip().lower()
+
+
+def dedupe_str_list(values: Any) -> List[str]:
+    if not isinstance(values, list):
+        return []
+    out: List[str] = []
+    seen: Set[str] = set()
+    for v in values:
+        s = str(v).strip()
+        if not s:
+            continue
+        key = normalize_name(s)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(s)
+    return out
+
+
+def get_allowed_dino_targets(scene_entity_catalog: Dict[str, Any]) -> List[str]:
+    # Source of truth: strategy scene entity catalog file.
+    return dedupe_str_list(scene_entity_catalog.get("entity_names"))
+
+
+def build_detector_user_payload(
+    target_slice: Dict[str, Any],
+    small_models: Dict[str, Any],
+    condition_primitives: Dict[str, Any],
+    allowed_dino_detect_targets: List[str],
+    scene_entity_catalog: Dict[str, Any],
+) -> Dict[str, Any]:
     return {
         "task": "build_detector_plan_for_single_slice",
         "policy": {
             "minimal_models_only": True,
+            "minimal_entities_only": True,
             "description": "Use the minimum sufficient models to judge completion. Avoid unnecessary entities.",
+            "grounding_dino_targets_must_come_from_scene_entities": True,
         },
+        "scene_entity_catalog_ref": "data/<case_id>/v2/strategy/scene_entities_v1.json",
+        "scene_entity_catalog": scene_entity_catalog,
         "condition_primitives_ref": "services/criteria-trainer/configs/detection_condition_primitives_v1.json",
         "condition_primitives": condition_primitives,
+        "allowed_dino_detect_targets": allowed_dino_detect_targets,
         "slice": target_slice,
         "small_model_catalog": small_models,
         "output_schema": {
@@ -89,7 +126,7 @@ def build_detector_user_payload(target_slice: Dict[str, Any], small_models: Dict
     }
 
 
-def sanitize_detector_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
+def sanitize_detector_plan(plan: Dict[str, Any], allowed_dino_targets: List[str] | None = None) -> Dict[str, Any]:
     allowed = {
         "slice_id",
         "slice_type",
@@ -99,6 +136,12 @@ def sanitize_detector_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
         "judgement_conditions",
     }
     cleaned = {k: v for k, v in plan.items() if k in allowed}
+    allowed_map: Dict[str, str] = {}
+    if isinstance(allowed_dino_targets, list):
+        for t in allowed_dino_targets:
+            ts = str(t).strip()
+            if ts:
+                allowed_map[normalize_name(ts)] = ts
     model_selection = cleaned.get("model_selection")
     if isinstance(model_selection, list):
         agg: Dict[str, List[str]] = {}
@@ -116,6 +159,11 @@ def sanitize_detector_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
                 targets = [x.strip() for x in re.split(r",| and ", raw) if x.strip()]
             agg.setdefault(model_id, [])
             for t in targets:
+                if model_id == "grounding-dino" and allowed_map:
+                    key = normalize_name(t)
+                    if key not in allowed_map:
+                        continue
+                    t = allowed_map[key]
                 if t not in agg[model_id]:
                     agg[model_id].append(t)
         cleaned["model_selection"] = [{"model_id": m, "detect_targets": ts} for m, ts in agg.items()]
@@ -177,7 +225,7 @@ def validate_judgement_code(code: str, primitive_names: Set[str]) -> Tuple[bool,
     return True, ""
 
 
-def validate_plan(plan: Dict[str, Any], primitive_names: Set[str]) -> Tuple[bool, str]:
+def validate_plan(plan: Dict[str, Any], primitive_names: Set[str], allowed_dino_targets: List[str] | None = None) -> Tuple[bool, str]:
     required = {"slice_id", "slice_type", "models_required", "model_selection", "execution_plan", "judgement_conditions"}
     missing = sorted([k for k in required if k not in plan])
     if missing:
@@ -187,6 +235,12 @@ def validate_plan(plan: Dict[str, Any], primitive_names: Set[str]) -> Tuple[bool
     if not isinstance(plan.get("model_selection"), list) or not plan["model_selection"]:
         return False, "model_selection must be non-empty list"
     seen_model_ids: Set[str] = set()
+    allowed_map: Dict[str, str] = {}
+    if isinstance(allowed_dino_targets, list):
+        for t in allowed_dino_targets:
+            ts = str(t).strip()
+            if ts:
+                allowed_map[normalize_name(ts)] = ts
     for idx, item in enumerate(plan["model_selection"]):
         if not isinstance(item, dict):
             return False, f"model_selection[{idx}] must be object"
@@ -202,6 +256,10 @@ def validate_plan(plan: Dict[str, Any], primitive_names: Set[str]) -> Tuple[bool
         dedup_targets = [str(t).strip() for t in targets if str(t).strip()]
         if len(dedup_targets) != len(set(dedup_targets)):
             return False, f"model_selection[{idx}].detect_targets contains duplicates"
+        if model_id == "grounding-dino" and allowed_map:
+            illegal = [t for t in dedup_targets if normalize_name(t) not in allowed_map]
+            if illegal:
+                return False, f"model_selection[{idx}].detect_targets not in scene_entity_catalog.entity_names: {', '.join(illegal)}"
     for idx, item in enumerate(plan["judgement_conditions"]):
         code = str(item.get("code", "")).strip() if isinstance(item, dict) else ""
         if not code:
@@ -287,7 +345,7 @@ def call_omni_for_detector_plan(
                 if chunk.choices and chunk.choices[0].delta.content:
                     parts.append(chunk.choices[0].delta.content)
             parsed = extract_json_from_text("".join(parts))
-            return sanitize_detector_plan(parsed)
+            return parsed
         except Exception:
             if i == max_retries:
                 raise
@@ -304,16 +362,43 @@ def get_step_slices(index_data: Dict[str, Any]) -> List[Dict[str, Any]]:
     return steps
 
 
+def get_transcript_full_segments(transcript: Dict[str, Any]) -> List[Dict[str, Any]]:
+    all_segments = transcript.get("segments")
+    if not isinstance(all_segments, list):
+        return []
+    full: List[Dict[str, Any]] = []
+    for seg in all_segments:
+        if not isinstance(seg, dict):
+            continue
+        seg_start = float(seg.get("start_sec", 0.0) or 0.0)
+        seg_end = float(seg.get("end_sec", seg_start) or seg_start)
+        if seg_end < seg_start:
+            seg_end = seg_start
+        full.append(
+            {
+                "segment_id": seg.get("segment_id"),
+                "start_sec": seg_start,
+                "end_sec": seg_end,
+                "speaker": seg.get("speaker", "unknown"),
+                "text": seg.get("text", ""),
+            }
+        )
+    return full
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build detector plans for all step slices")
     parser.add_argument("--case-id", required=True)
     parser.add_argument("--slice-index", default=None)
     parser.add_argument("--small-model-config", default=str(ROOT / "services" / "criteria-trainer" / "configs" / "small_models_v1.json"))
+    parser.add_argument("--scene-entities-config", default=None)
+    parser.add_argument("--transcript", default=None, help="path to FunASR transcript json; default data/<case_id>/v2/asr/transcript_v1.json")
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--model", default=TA_MODEL)
     parser.add_argument("--base-url", default=TA_BASE_URL)
     parser.add_argument("--request-timeout-sec", type=int, default=TA_REQUEST_TIMEOUT_SEC)
     parser.add_argument("--max-retries", type=int, default=3)
+    parser.add_argument("--retry-invalid-times", type=int, default=2, help="extra retries per step when generated plan is invalid or step generation fails")
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--require-omni", action="store_true")
     args = parser.parse_args()
@@ -326,24 +411,36 @@ def main() -> None:
 
     case_v2_dir = ROOT / "data" / args.case_id / "v2"
     index_path = Path(args.slice_index) if args.slice_index else (case_v2_dir / "slices" / "index.json")
+    scene_entities_path = (
+        Path(args.scene_entities_config)
+        if args.scene_entities_config
+        else (case_v2_dir / "strategy" / "scene_entities_v1.json")
+    )
+    transcript_path = Path(args.transcript) if args.transcript else (case_v2_dir / "asr" / "transcript_v1.json")
     output_dir = Path(args.output_dir) if args.output_dir else (case_v2_dir / "detector-plans")
 
     index_data = read_json(index_path)
     small_models = read_json(Path(args.small_model_config))
+    scene_entity_catalog = read_json(scene_entities_path)
+    transcript = read_json(transcript_path)
     condition_primitives = read_json(CONDITION_PRIMITIVES_PATH)
     primitive_names = extract_primitive_names(condition_primitives)
     system_prompt = read_text(DETECTOR_SYSTEM_PROMPT_PATH)
     user_template = read_text(DETECTOR_USER_PROMPT_TEMPLATE_PATH)
 
     step_slices = get_step_slices(index_data)
+    allowed_dino_targets = get_allowed_dino_targets(scene_entity_catalog)
     if not step_slices:
         raise RuntimeError("no step slices found in index")
+    if not allowed_dino_targets:
+        raise RuntimeError("scene_entities_v1.json entity_names is empty; cannot constrain grounding-dino detect targets")
 
     successes: List[Dict[str, Any]] = []
     failures: List[Dict[str, Any]] = []
     all_sanitized = True
     all_codes_valid = True
     grounding_dino_targets: Set[str] = set()
+    step_attempts = max(1, 1 + int(args.retry_invalid_times))
 
     for step in step_slices:
         slice_id = str(step.get("slice_id", "")).strip()
@@ -353,8 +450,8 @@ def main() -> None:
 
         if out_path.exists() and not args.force:
             try:
-                existing = sanitize_detector_plan(read_json(out_path))
-                ok, err = validate_plan(existing, primitive_names)
+                existing = sanitize_detector_plan(read_json(out_path), allowed_dino_targets=allowed_dino_targets)
+                ok, err = validate_plan(existing, primitive_names, allowed_dino_targets=allowed_dino_targets)
                 if ok:
                     for t in extract_grounding_dino_targets(existing):
                         grounding_dino_targets.add(t)
@@ -363,32 +460,75 @@ def main() -> None:
             except Exception:
                 pass
 
-        try:
-            clip_path = ROOT / "data" / Path(str(step["clip_path"]))
-            payload = build_detector_user_payload(step, small_models, condition_primitives)
-            user_prompt = build_user_prompt(user_template, {"payload_json": json.dumps(payload, ensure_ascii=False, indent=2)})
-            video_uri = upload_video_to_dashscope_oss(clip_path, api_key, args.model)
-            plan = call_omni_for_detector_plan(
-                api_key=api_key,
-                model=args.model,
-                base_url=args.base_url,
-                request_timeout_sec=args.request_timeout_sec,
-                max_retries=args.max_retries,
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                video_uri=video_uri,
+        clip_path = ROOT / "data" / Path(str(step["clip_path"]))
+        payload = build_detector_user_payload(
+            step,
+            small_models,
+            condition_primitives,
+            allowed_dino_targets,
+            scene_entity_catalog,
+        )
+        payload["transcript_ref"] = str(transcript_path)
+        payload["transcript_full"] = get_transcript_full_segments(transcript)
+        user_prompt = build_user_prompt(user_template, {"payload_json": json.dumps(payload, ensure_ascii=False, indent=2)})
+        video_uri = upload_video_to_dashscope_oss(clip_path, api_key, args.model)
+
+        last_error = ""
+        debug_attempts: List[Dict[str, Any]] = []
+        generated = False
+        for attempt in range(1, step_attempts + 1):
+            try:
+                raw_plan = call_omni_for_detector_plan(
+                    api_key=api_key,
+                    model=args.model,
+                    base_url=args.base_url,
+                    request_timeout_sec=args.request_timeout_sec,
+                    max_retries=args.max_retries,
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    video_uri=video_uri,
+                )
+                plan = sanitize_detector_plan(raw_plan, allowed_dino_targets=allowed_dino_targets)
+                debug_attempts.append(
+                    {
+                        "attempt": attempt,
+                        "raw_model_selection": raw_plan.get("model_selection") if isinstance(raw_plan, dict) else None,
+                        "sanitized_model_selection": plan.get("model_selection"),
+                    }
+                )
+                ok, err = validate_plan(plan, primitive_names, allowed_dino_targets=allowed_dino_targets)
+                if not ok:
+                    all_codes_valid = False
+                    raise RuntimeError(f"invalid plan: {err}")
+                for t in extract_grounding_dino_targets(plan):
+                    grounding_dino_targets.add(t)
+                write_json(out_path, plan)
+                successes.append(
+                    {
+                        "slice_id": slice_id,
+                        "status": "generated",
+                        "file": str(out_path),
+                        "attempts": attempt,
+                    }
+                )
+                generated = True
+                break
+            except Exception as exc:
+                last_error = str(exc)
+                if len(debug_attempts) < attempt:
+                    debug_attempts.append({"attempt": attempt, "error": last_error})
+                if attempt < step_attempts:
+                    continue
+
+        if not generated:
+            failures.append(
+                {
+                    "slice_id": slice_id,
+                    "error": last_error,
+                    "attempts": step_attempts,
+                    "debug_attempts": debug_attempts,
+                }
             )
-            plan = sanitize_detector_plan(plan)
-            ok, err = validate_plan(plan, primitive_names)
-            if not ok:
-                all_codes_valid = False
-                raise RuntimeError(f"invalid plan: {err}")
-            for t in extract_grounding_dino_targets(plan):
-                grounding_dino_targets.add(t)
-            write_json(out_path, plan)
-            successes.append({"slice_id": slice_id, "status": "generated", "file": str(out_path)})
-        except Exception as exc:
-            failures.append({"slice_id": slice_id, "error": str(exc)})
 
     produced_count = len(successes)
     failed_count = len(failures)

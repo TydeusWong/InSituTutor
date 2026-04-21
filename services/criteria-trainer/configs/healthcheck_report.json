@@ -1,6 +1,6 @@
 {
   "pipeline_stage": "criteria-trainer:small-model-healthcheck",
-  "generated_at": "2026-04-19T10:22:28.899025+00:00",
+  "generated_at": "2026-04-21T07:03:57.909257+00:00",
   "catalog_version": "v1",
   "package_checks": {
     "mediapipe": {
@@ -17,7 +17,7 @@
     },
     "torch": {
       "ok": true,
-      "version": "2.5.1+cpu"
+      "version": "2.6.0+cu124"
     }
   },
   "adapter_checks": [
@@ -29,12 +29,16 @@
     {
       "model_id": "mediapipe-hand-landmarker",
       "ok": true,
-      "model_name": "mediapipe-hand-landmarker"
+      "model_name": "mediapipe-hand-landmarker",
+      "backend": "tasks"
     },
     {
-      "model_id": "grounding-dino",
+      "model_id": "IDEA-Research/grounding-dino-base",
       "ok": true,
-      "model_name": "grounding-dino"
+      "model_name": "grounding-dino",
+      "torch_cuda_available": true,
+      "processor_id": "IDEA-Research/grounding-dino-base",
+      "local_files_only": false
     },
     {
       "model_id": "yolo",
@@ -51,8 +55,8 @@
     "os": "Windows-10-10.0.26200-SP0",
     "python": "3.10.13",
     "ffmpeg_available": true,
-    "torch_cuda": false,
-    "torch_cuda_device_count": 0,
+    "torch_cuda": true,
+    "torch_cuda_device_count": 1,
     "onnxruntime_error": "DLL load failed while importing onnxruntime_pybind11_state: 动态链接库(DLL)初始化例程失败。"
   }
 }

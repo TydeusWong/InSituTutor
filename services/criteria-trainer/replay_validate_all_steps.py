@@ -484,7 +484,7 @@ def eval_condition_code(code: str, context: Dict[str, Any]) -> bool:
 
     def hand_in_bbox(hand_point: str, object_id: str) -> bool:
         # v1 proxy: approximate by near-center threshold
-        return hand_to_bbox_distance(hand_point, object_id) <= 0.06
+        return hand_to_bbox_distance(hand_point, object_id) <= 0.12
 
     safe_globals: Dict[str, Any] = {"__builtins__": {}}
     safe_locals: Dict[str, Any] = {

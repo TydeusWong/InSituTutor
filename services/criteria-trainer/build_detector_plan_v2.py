@@ -59,15 +59,47 @@ def build_user_prompt(template: str, payload: Dict[str, Any]) -> str:
     return out
 
 
-def build_detector_user_payload(target_slice: Dict[str, Any], small_models: Dict[str, Any], condition_primitives: Dict[str, Any]) -> Dict[str, Any]:
+def normalize_name(value: Any) -> str:
+    return str(value).strip().lower()
+
+
+def dedupe_str_list(values: Any) -> List[str]:
+    if not isinstance(values, list):
+        return []
+    out: List[str] = []
+    seen = set()
+    for v in values:
+        s = str(v).strip()
+        if not s:
+            continue
+        key = normalize_name(s)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(s)
+    return out
+
+
+def get_allowed_dino_targets(index_data: Dict[str, Any]) -> List[str]:
+    return dedupe_str_list(index_data.get("scene_entities"))
+
+
+def build_detector_user_payload(
+    target_slice: Dict[str, Any],
+    small_models: Dict[str, Any],
+    condition_primitives: Dict[str, Any],
+    allowed_dino_detect_targets: List[str],
+) -> Dict[str, Any]:
     return {
         "task": "build_detector_plan_for_single_slice",
         "policy": {
             "minimal_models_only": True,
             "description": "Use the minimum sufficient models to judge completion. Avoid unnecessary entities.",
+            "grounding_dino_targets_must_come_from_scene_entities": True,
         },
         "condition_primitives_ref": "services/criteria-trainer/configs/detection_condition_primitives_v1.json",
         "condition_primitives": condition_primitives,
+        "allowed_dino_detect_targets": allowed_dino_detect_targets,
         "slice": target_slice,
         "small_model_catalog": small_models,
         "output_schema": {
@@ -88,7 +120,7 @@ def build_detector_user_payload(target_slice: Dict[str, Any], small_models: Dict
     }
 
 
-def sanitize_detector_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
+def sanitize_detector_plan(plan: Dict[str, Any], allowed_dino_targets: List[str] | None = None) -> Dict[str, Any]:
     allowed = {
         "slice_id",
         "slice_type",
@@ -98,6 +130,12 @@ def sanitize_detector_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
         "judgement_conditions",
     }
     cleaned = {k: v for k, v in plan.items() if k in allowed}
+    allowed_map: Dict[str, str] = {}
+    if isinstance(allowed_dino_targets, list):
+        for t in allowed_dino_targets:
+            ts = str(t).strip()
+            if ts:
+                allowed_map[normalize_name(ts)] = ts
     model_selection = cleaned.get("model_selection")
     if isinstance(model_selection, list):
         agg: Dict[str, List[str]] = {}
@@ -115,6 +153,11 @@ def sanitize_detector_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
                 targets = [x.strip() for x in re.split(r",| and ", raw) if x.strip()]
             agg.setdefault(model_id, [])
             for t in targets:
+                if model_id == "grounding-dino" and allowed_map:
+                    key = normalize_name(t)
+                    if key not in allowed_map:
+                        continue
+                    t = allowed_map[key]
                 if t not in agg[model_id]:
                     agg[model_id].append(t)
         cleaned["model_selection"] = [{"model_id": m, "detect_targets": ts} for m, ts in agg.items()]
@@ -266,6 +309,9 @@ def main() -> None:
     system_prompt = read_text(DETECTOR_SYSTEM_PROMPT_PATH)
     user_template = read_text(DETECTOR_USER_PROMPT_TEMPLATE_PATH)
     target_slice = choose_first_step_slice(index_data)
+    allowed_dino_targets = get_allowed_dino_targets(index_data)
+    if not allowed_dino_targets:
+        raise RuntimeError("index.scene_entities is empty; cannot constrain grounding-dino detect targets")
     clip_path = ROOT / "data" / Path(target_slice["clip_path"])
 
     mode = "mock"
@@ -280,6 +326,7 @@ def main() -> None:
             target_slice=target_slice,
             small_models=small_models,
             condition_primitives=condition_primitives,
+            allowed_dino_detect_targets=allowed_dino_targets,
         )
         user_prompt = build_user_prompt(
             user_template,
@@ -296,6 +343,7 @@ def main() -> None:
             user_prompt=user_prompt,
             video_uri=video_uri,
         )
+        plan = sanitize_detector_plan(plan, allowed_dino_targets=allowed_dino_targets)
         mode = "omni"
     else:
         plan = build_mock_detector_plan(target_slice, small_models)

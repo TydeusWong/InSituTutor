@@ -182,6 +182,8 @@ def mock_sections(item: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "video_overview": {
             "summary": "该视频演示了目标物体摆放与收尾确认流程。",
+            "camera_view": "top_down",
+            "scene_entities": ["black can", "transparent tape"],
             "total_sections": 2,
             "section_atomic_counts": [
                 {"section_ref": "section_01", "atomic_unit_count": 3},

@@ -42,6 +42,20 @@ def normalize_range(time_range: Dict[str, Any]) -> Tuple[float, float]:
     return start, end
 
 
+def dedupe_str_list(values: Any) -> List[str]:
+    if not isinstance(values, list):
+        return []
+    out: List[str] = []
+    seen = set()
+    for v in values:
+        s = str(v).strip()
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    return out
+
+
 def run_ffmpeg_cut(video_path: Path, start: float, end: float, out_file: Path) -> None:
     out_file.parent.mkdir(parents=True, exist_ok=True)
     cmd = [
@@ -91,6 +105,11 @@ def main() -> None:
     demo = (sections_units.get("demos") or [{}])[0]
     video_overview = demo.get("video_overview", {})
     global_summary = str(video_overview.get("summary", "")).strip()
+    strategy_task = strategy.get("task") if isinstance(strategy.get("task"), dict) else {}
+    camera_view = str(video_overview.get("camera_view") or strategy_task.get("camera_view") or "unknown").strip()
+    scene_entities = dedupe_str_list(video_overview.get("scene_entities"))
+    if not scene_entities:
+        scene_entities = dedupe_str_list(strategy_task.get("scene_entities"))
 
     slices: List[Dict[str, Any]] = []
     for section in strategy.get("sections", []):
@@ -158,6 +177,8 @@ def main() -> None:
         "generated_at": utc_now_iso(),
         "case_id": args.case_id,
         "source_video_path": str(video_path),
+        "camera_view": camera_view,
+        "scene_entities": scene_entities,
         "video_overview_summary": global_summary,
         "slice_count": len(slices),
         "slices": slices,

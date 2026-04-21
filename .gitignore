@@ -2,9 +2,10 @@
 __pycache__/
 *.pyc
 data/
+data_backup/
 TODOlist.md
 TODOlist_02.md
 tests/
 docs/
 yolo11n.pt
-models/
+models/small-models/

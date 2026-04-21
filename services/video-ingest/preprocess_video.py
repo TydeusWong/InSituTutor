@@ -459,6 +459,44 @@ def build_single_video_manifest(
     }
 
 
+def run_funasr_transcription_after_ingest(
+    case_id: str,
+    ingest_manifest_path: Path,
+    asr_model: str,
+    asr_vad_model: str,
+    asr_punc_model: str,
+    asr_spk_model: str,
+    asr_device: str,
+    keep_asr_wav: bool,
+) -> Path:
+    script_path = ROOT / "services" / "criteria-trainer" / "transcribe_audio_funasr.py"
+    cmd = [
+        sys.executable,
+        str(script_path),
+        "--case-id",
+        case_id,
+        "--ingest-manifest",
+        str(ingest_manifest_path),
+        "--model",
+        asr_model,
+        "--vad-model",
+        asr_vad_model,
+        "--punc-model",
+        asr_punc_model,
+        "--spk-model",
+        asr_spk_model,
+        "--device",
+        asr_device,
+    ]
+    if keep_asr_wav:
+        cmd.append("--keep-wav")
+    proc = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, check=False)
+    if proc.returncode != 0:
+        raise RuntimeError(f"FunASR transcription failed: {proc.stderr.strip()[:1200]}")
+    # Default output used by transcribe_audio_funasr.py
+    return ROOT / "data" / case_id / "v2" / "asr" / "transcript_v1.json"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Step-1: video preprocessing (compress if needed)")
     parser.add_argument("--video", help="input video path (single file mode)")
@@ -476,6 +514,13 @@ def main() -> None:
         default=None,
         help="output directory for compressed videos",
     )
+    parser.add_argument("--skip-asr", action="store_true", help="skip FunASR transcription after preprocessing")
+    parser.add_argument("--asr-model", default="paraformer-zh")
+    parser.add_argument("--asr-vad-model", default="fsmn-vad")
+    parser.add_argument("--asr-punc-model", default="ct-punc")
+    parser.add_argument("--asr-spk-model", default="cam++")
+    parser.add_argument("--asr-device", default="cuda:0")
+    parser.add_argument("--keep-asr-wav", action="store_true")
     args = parser.parse_args()
     if args.video:
         video_path = resolve_under_root(args.video)
@@ -495,6 +540,18 @@ def main() -> None:
         )
         output_manifest_path = resolve_under_root(args.output_manifest) if args.output_manifest else (ROOT / "data" / case_id / "ingest_manifest.json")
         write_json(output_manifest_path, manifest_obj)
+        if not args.skip_asr:
+            transcript_path = run_funasr_transcription_after_ingest(
+                case_id=case_id,
+                ingest_manifest_path=output_manifest_path,
+                asr_model=args.asr_model,
+                asr_vad_model=args.asr_vad_model,
+                asr_punc_model=args.asr_punc_model,
+                asr_spk_model=args.asr_spk_model,
+                asr_device=args.asr_device,
+                keep_asr_wav=args.keep_asr_wav,
+            )
+            print(f"[OK] transcript: {transcript_path}")
         print(f"[OK] preprocessed video: {result}")
         print(f"[OK] ingest manifest: {output_manifest_path}")
         return
@@ -513,6 +570,18 @@ def main() -> None:
     ingest_manifest = build_ingest_manifest(manifest, max_mb=args.max_mb, out_dir=out_dir)
     output_manifest_path = resolve_under_root(args.output_manifest) if args.output_manifest else (ROOT / "data" / case_id / "ingest_manifest.json")
     write_json(output_manifest_path, ingest_manifest)
+    if not args.skip_asr:
+        transcript_path = run_funasr_transcription_after_ingest(
+            case_id=case_id,
+            ingest_manifest_path=output_manifest_path,
+            asr_model=args.asr_model,
+            asr_vad_model=args.asr_vad_model,
+            asr_punc_model=args.asr_punc_model,
+            asr_spk_model=args.asr_spk_model,
+            asr_device=args.asr_device,
+            keep_asr_wav=args.keep_asr_wav,
+        )
+        print(f"[OK] transcript: {transcript_path}")
     print(str(output_manifest_path))
 
 

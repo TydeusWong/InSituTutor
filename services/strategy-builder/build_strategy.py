@@ -49,6 +49,30 @@ def normalize_time_range(time_range: Dict[str, Any]) -> Dict[str, float]:
     return {"start_sec": start, "end_sec": end}
 
 
+def dedupe_str_list(values: List[Any]) -> List[str]:
+    out: List[str] = []
+    seen = set()
+    for value in values:
+        item = str(value).strip()
+        if not item or item in seen:
+            continue
+        seen.add(item)
+        out.append(item)
+    return out
+
+
+def build_scene_entities_catalog(case_id: str, entities: List[str]) -> Dict[str, Any]:
+    deduped = dedupe_str_list(entities)
+    return {
+        "version": "v1",
+        "frozen_at": utc_now_iso(),
+        "case_id": case_id,
+        "source_stage": "strategy-builder",
+        "entity_count": len(deduped),
+        "entity_names": deduped,
+    }
+
+
 def build_step(section_id: str, order: int, unit: Dict[str, Any]) -> Dict[str, Any]:
     unit_id = str(unit.get("unit_id", f"unit_{section_id}_{order:03d}"))
     step_id = f"{section_id}_step_{order:02d}"
@@ -139,10 +163,15 @@ def transform_demo(demo: Dict[str, Any]) -> Dict[str, Any]:
             }
         )
 
+    overview = demo.get("video_overview") if isinstance(demo.get("video_overview"), dict) else {}
+    camera_view = str(overview.get("camera_view") or "unknown")
+    scene_entities = dedupe_str_list(overview.get("scene_entities") if isinstance(overview.get("scene_entities"), list) else [])
+
     return {
         "task": {
             "task_id": demo.get("task_id", "task-demo"),
-            "scene_tags": demo.get("scene_tags", []),
+            "camera_view": camera_view,
+            "scene_entities": scene_entities,
             "source_audio_quality": demo.get("source_audio_quality", "unknown"),
         },
         "sections": sections_out,
@@ -178,17 +207,29 @@ def main() -> None:
     output_dir = Path(args.output_dir) if args.output_dir else (ROOT / "data" / case_id / "v2" / "strategy")
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Build global union for scene entities across demos, so top-level strategy can reuse a stable catalog.
+    global_scene_entities: List[str] = []
+    for demo in demos:
+        overview = demo.get("video_overview") if isinstance(demo.get("video_overview"), dict) else {}
+        if isinstance(overview.get("scene_entities"), list):
+            global_scene_entities.extend(overview["scene_entities"])
+    global_scene_entities = dedupe_str_list(global_scene_entities)
+
     built = []
     for demo in demos:
         strategy = transform_demo(demo)
+        if global_scene_entities:
+            strategy["task"]["scene_entities"] = global_scene_entities
         video_id = str(demo.get("video_id", "unknown_video"))
         out_file = output_dir / f"{video_id}_teaching_strategy_v2.json"
         write_json(out_file, strategy)
         built.append(strategy)
 
     write_json(output_dir / "teaching_strategy_v2.json", built[0] if len(built) == 1 else {"tasks": built, "generated_at": utc_now_iso()})
+    write_json(output_dir / "scene_entities_v1.json", build_scene_entities_catalog(case_id=case_id, entities=global_scene_entities))
     print(f"[OK] built strategies: {len(built)}")
     print(f"[OK] output dir: {output_dir}")
+    print(f"[OK] scene entities catalog: {output_dir / 'scene_entities_v1.json'}")
 
 
 if __name__ == "__main__":
