@@ -9,3 +9,6 @@ tests/
 docs/
 yolo11n.pt
 models/small-models/
+TODOlists/
+.vscode/
+.ultralytics/

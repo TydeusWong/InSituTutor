@@ -1,0 +1,30 @@
+{
+  "version": "v1",
+  "notes": "Bootstrap config for generating YOLO dataset from DINO pseudo labels",
+  "sampling": {
+    "max_frames_per_step": 30,
+    "min_frames_per_step": 10,
+    "seed": 42
+  },
+  "split": {
+    "val_ratio": 0.2
+  },
+  "dino": {
+    "box_threshold": 0.3,
+    "text_threshold": 0.3,
+    "local_files_only": true
+  },
+  "filters": {
+    "min_confidence": 0.25,
+    "min_box_area_norm": 0.0005,
+    "max_box_area_norm": 0.8,
+    "max_aspect_ratio": 8.0
+  },
+  "yolo_train": {
+    "base_model": "yolo11n.pt",
+    "epochs": 80,
+    "imgsz": 640,
+    "batch": 16,
+    "device": "cuda:0"
+  }
+}
