@@ -13,6 +13,7 @@ if str(SCRIPT_DIR) not in sys.path:
 
 DEFAULT_BOOTSTRAP_CONFIG = ROOT / "services" / "criteria-trainer" / "configs" / "yolo_bootstrap_config_v1.json"
 DEFAULT_REGISTRY_PATH = ROOT / "services" / "criteria-trainer" / "configs" / "yolo_registry_v1.json"
+DEFAULT_BASE_MODEL = ROOT / "models" / "small-models" / "object" / "yolo" / "yolo11n.pt"
 
 
 def utc_now_iso() -> str:
@@ -47,7 +48,7 @@ def main() -> None:
     cfg = read_json(Path(args.config))
     train_cfg = cfg.get("yolo_train", {})
 
-    base_model = args.base_model or str(train_cfg.get("base_model", "yolo11n.pt"))
+    base_model = args.base_model or str(train_cfg.get("base_model", str(DEFAULT_BASE_MODEL)))
     epochs = int(args.epochs if args.epochs is not None else train_cfg.get("epochs", 80))
     imgsz = int(args.imgsz if args.imgsz is not None else train_cfg.get("imgsz", 640))
     batch = int(args.batch if args.batch is not None else train_cfg.get("batch", 16))
@@ -61,7 +62,7 @@ def main() -> None:
     class_map = read_json(class_map_path) if class_map_path.exists() else {"classes": []}
 
     run_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    project_dir = ROOT / "models" / "small-models" / "object" / "yolo" / "runs" / args.case_id
+    project_dir = ROOT / "data" / args.case_id / "v3" / "yolo-runs"
     project_dir.mkdir(parents=True, exist_ok=True)
 
     # Keep Ultralytics config/cache inside workspace to avoid host-profile permission issues.

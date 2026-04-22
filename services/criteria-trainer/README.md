@@ -49,7 +49,7 @@ python services/criteria-trainer/bootstrap_yolo_dataset_from_dino.py \
 ```bash
 python services/criteria-trainer/train_yolo_from_bootstrap.py \
   --case-id test_cake \
-  --base-model yolo11n.pt \
+  --base-model models/small-models/object/yolo/yolo11n.pt \
   --device cuda:0 \
   --workers 0
 ```
@@ -81,7 +81,7 @@ Main V3 outputs:
 - `data/<case_id>/v3/yolo-bootstrap/input_snapshot.json`
 - `data/<case_id>/v3/yolo-bootstrap/annotation_report.json`
 - `data/<case_id>/v3/yolo-dataset/data.yaml`
-- `models/small-models/object/yolo/runs/<case_id>/<run_id>/weights/best.pt`
+- `data/<case_id>/v3/yolo-runs/<run_id>/weights/best.pt`
 - `services/criteria-trainer/configs/yolo_registry_v1.json`
 - `data/<case_id>/v3/replay-validation-yolo/all_steps_result.json`
 - `data/<case_id>/v3/replay-validation-yolo/speed_compare_report.json`

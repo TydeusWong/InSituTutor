@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>InSituTutor 实时教学</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;700;900&family=Space+Grotesk:wght@500;700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <span class="badge">Realtime</span>
+        <h1>InSituTutor 教学试验台</h1>
+      </div>
+      <div id="status-pill" class="status-pill">未开始</div>
+    </header>
+
+    <main class="layout">
+      <section class="panel lesson-panel">
+        <div class="panel-title">教学信息</div>
+        <div class="section-meta">
+          <div id="section-name" class="section-name">-</div>
+          <div id="section-goal" class="section-goal">-</div>
+        </div>
+
+        <div class="step-block">
+          <div class="label">当前步骤</div>
+          <div id="step-prompt" class="step-prompt">等待会话启动</div>
+          <div class="small-title">关注点</div>
+          <ul id="focus-list" class="small-list"></ul>
+          <div class="small-title">常见错误</div>
+          <ul id="mistake-list" class="small-list"></ul>
+        </div>
+
+        <div class="metrics">
+          <div>章节：<span id="section-progress">-</span></div>
+          <div>步骤：<span id="step-progress">-</span></div>
+          <div>模型：<span id="detector-source">-</span></div>
+          <div>Omni：<span id="omni-result">-</span></div>
+        </div>
+
+        <div class="actions">
+          <button id="btn-start" class="btn primary">开始会话</button>
+          <button id="btn-next" class="btn warning">下一章节</button>
+          <button id="btn-retry" class="btn">重试本章</button>
+          <button id="btn-reset" class="btn success">重新开始</button>
+        </div>
+      </section>
+
+      <section class="panel video-panel">
+        <div class="panel-title">实时画面</div>
+        <div class="video-wrap">
+          <img id="video-feed" alt="IP Webcam Stream" />
+        </div>
+        <div id="server-message" class="server-message"></div>
+      </section>
+    </main>
+
+    <script src="/app.js"></script>
+  </body>
+</html>

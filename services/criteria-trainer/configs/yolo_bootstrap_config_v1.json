@@ -21,7 +21,7 @@
     "max_aspect_ratio": 8.0
   },
   "yolo_train": {
-    "base_model": "yolo11n.pt",
+    "base_model": "models/small-models/object/yolo/yolo11n.pt",
     "epochs": 80,
     "imgsz": 640,
     "batch": 16,
