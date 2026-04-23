@@ -2,6 +2,7 @@ const state = {
   sessionId: null,
   running: false,
   timer: null,
+  videoTimer: null,
   pending: false,
 };
 
@@ -58,8 +59,9 @@ function render(snapshot) {
   }
   el.serverMessage.textContent = snapshot.message || "";
 
-  if (snapshot.video_feed_url && el.videoFeed.src !== snapshot.video_feed_url) {
-    el.videoFeed.src = snapshot.video_feed_url;
+  const overlayUrl = snapshot.video_feed_overlay_url || snapshot.video_feed_url;
+  if (overlayUrl) {
+    el.videoFeed.dataset.baseUrl = overlayUrl;
   }
 
   if (snapshot.is_done) {
@@ -127,15 +129,29 @@ async function evaluateTick() {
   }
 }
 
+function refreshVideoFrame() {
+  const baseUrl = el.videoFeed.dataset.baseUrl;
+  if (!baseUrl) return;
+  const sep = baseUrl.includes("?") ? "&" : "?";
+  el.videoFeed.src = `${baseUrl}${sep}_t=${Date.now()}`;
+}
+
 function startLoop() {
   if (state.timer) return;
   state.timer = setInterval(evaluateTick, 300);
+  if (!state.videoTimer) {
+    state.videoTimer = setInterval(refreshVideoFrame, 250);
+  }
 }
 
 function stopLoop() {
   if (!state.timer) return;
   clearInterval(state.timer);
   state.timer = null;
+  if (state.videoTimer) {
+    clearInterval(state.videoTimer);
+    state.videoTimer = null;
+  }
 }
 
 el.btnStart.addEventListener("click", startSession);

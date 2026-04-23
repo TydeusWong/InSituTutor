@@ -203,6 +203,7 @@ class SessionState:
     last_eval: Optional[Dict[str, Any]] = None
     last_omni: Optional[Dict[str, Any]] = None
     completed_steps: List[str] = field(default_factory=list)
+    last_visual_frame_jpg: bytes = b""
 
 
 class RealtimeTutorEngine:
@@ -226,6 +227,59 @@ class RealtimeTutorEngine:
         self.hand_adapter: Optional[MediaPipeHandAdapter] = None
         self.sessions: Dict[str, SessionState] = {}
         self._lock = threading.Lock()
+
+    @staticmethod
+    def _safe_float(v: Any, default: float = 0.0) -> float:
+        try:
+            return float(v)
+        except Exception:
+            return default
+
+    def _infer_yolo_detections(self, frame_bgr: Any, targets: List[str], frame_index: int) -> List[Dict[str, Any]]:
+        payload = InferenceInput(
+            frame_bgr=frame_bgr,
+            timestamp_sec=time.time(),
+            frame_index=frame_index,
+            context={"detect_targets": targets},
+        )
+        out = self.yolo_adapter.infer(payload)
+        detections = out.features.get("detections", [])
+        if not isinstance(detections, list):
+            return []
+        return [d for d in detections if isinstance(d, dict)]
+
+    def _render_overlay_frame(
+        self,
+        frame_bgr: Any,
+        detections: List[Dict[str, Any]],
+        object_targets: List[str],
+        matched: bool,
+        step_id: str,
+    ) -> bytes:
+        vis = frame_bgr.copy()
+        target_norm = {normalize_name(x) for x in object_targets}
+        for det in detections:
+            label = str(det.get("label", det.get("target", ""))).strip()
+            if not label:
+                continue
+            if target_norm and normalize_name(label) not in target_norm:
+                continue
+            bbox = det.get("bbox_xyxy", {})
+            if not isinstance(bbox, dict):
+                continue
+            x1 = int(self._safe_float(bbox.get("x1", 0.0)) * vis.shape[1])
+            y1 = int(self._safe_float(bbox.get("y1", 0.0)) * vis.shape[0])
+            x2 = int(self._safe_float(bbox.get("x2", 0.0)) * vis.shape[1])
+            y2 = int(self._safe_float(bbox.get("y2", 0.0)) * vis.shape[0])
+            score = self._safe_float(det.get("score", 0.0))
+            color = (30, 200, 30)
+            cv2.rectangle(vis, (x1, y1), (x2, y2), color, 2)
+            text = f"{label} {score:.2f}"
+            cv2.putText(vis, text, (max(4, x1), max(18, y1 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
+        status = "MATCHED" if matched else "RUNNING"
+        status_color = (20, 180, 20) if matched else (0, 180, 255)
+        cv2.putText(vis, f"{step_id} | {status}", (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.75, status_color, 2, cv2.LINE_AA)
+        return frame_to_jpeg_bytes(vis, quality=80)
 
     def _build_sections(self, strategy: Dict[str, Any]) -> List[SectionRuntime]:
         out: List[SectionRuntime] = []
@@ -383,6 +437,12 @@ class RealtimeTutorEngine:
         self._log_event(session, "section_enter", {"reason": reason, "section": self._section_intro_payload(session)})
 
     def _start_step_running(self, session: SessionState) -> None:
+        sec = self._current_section(session)
+        if sec is not None and len(sec.steps) == 0:
+            # Empty section should be skipped, not treated as course completion.
+            self._log_event(session, "section_auto_skip_empty", {"section_id": sec.section_id})
+            self._goto_next_section(session, reason="empty_section_auto_skip")
+            return
         session.state = "step_running"
         session.state_until = 0.0
         session.next_sample_at = 0.0
@@ -617,7 +677,12 @@ class RealtimeTutorEngine:
 
             step = self._current_step(session)
             if not step:
-                session.state = "course_done"
+                sec = self._current_section(session)
+                if sec is not None and len(sec.steps) == 0:
+                    self._log_event(session, "section_auto_skip_empty", {"section_id": sec.section_id})
+                    self._goto_next_section(session, reason="empty_section_auto_skip")
+                else:
+                    session.state = "course_done"
                 return self._snapshot(session)
             step_id = str(step.get("step_id", ""))
             plan = self._load_step_plan(step_id)
@@ -644,6 +709,12 @@ class RealtimeTutorEngine:
             if jpg:
                 session.recent_frames.append((ts, jpg))
 
+            overlay_detections = self._infer_yolo_detections(
+                frame_bgr=frame,
+                targets=disambiguation_targets,
+                frame_index=session.step_sample_seq,
+            )
+
             ctx = build_context(
                 frame_bgr=frame,
                 frame_index=session.step_sample_seq,
@@ -660,8 +731,20 @@ class RealtimeTutorEngine:
                 hand_adapter=self.hand_adapter if use_hand_model else None,
                 use_hand_model=use_hand_model,
                 enable_dino_fallback=False,
+                yolo_detections=overlay_detections,
             )
             matched = eval_condition_code(code, ctx, hand_in_bbox_threshold=self.cfg.hand_in_bbox_threshold)
+            overlay_jpg = self._render_overlay_frame(
+                frame_bgr=frame,
+                detections=overlay_detections,
+                object_targets=object_targets,
+                matched=bool(matched),
+                step_id=step_id,
+            )
+            if overlay_jpg:
+                session.last_visual_frame_jpg = overlay_jpg
+            elif jpg:
+                session.last_visual_frame_jpg = jpg
             trace_payload = {
                 "step_id": step_id,
                 "sample_seq": session.step_sample_seq,
@@ -695,6 +778,20 @@ class RealtimeTutorEngine:
 
             self._write_session_meta(session)
             return self._snapshot(session)
+
+    def get_visual_frame(self, session_id: str) -> bytes:
+        with self._lock:
+            session = self.sessions.get(session_id)
+            if session is None:
+                return b""
+            if session.last_visual_frame_jpg:
+                return session.last_visual_frame_jpg
+            frame = self.frame_source.read_frame()
+            if frame is None:
+                return b""
+            raw = frame_to_jpeg_bytes(frame, quality=75)
+            session.last_visual_frame_jpg = raw
+            return raw
 
     def force_next_section(self, session_id: str) -> Dict[str, Any]:
         with self._lock:
@@ -770,6 +867,7 @@ class RealtimeTutorEngine:
             "state": session.state,
             "message": message,
             "video_feed_url": self.frame_source.stream_display_url(),
+            "video_feed_overlay_url": f"/api/realtime/frame?session_id={session.session_id}",
             "section": {
                 "index": session.section_idx,
                 "count": section_count,
@@ -828,6 +926,15 @@ class RealtimeHandler(BaseHTTPRequestHandler):
         except Exception:
             return {}
 
+    def _jpeg(self, status: int, blob: bytes) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", "image/jpeg")
+        self.send_header("Content-Length", str(len(blob)))
+        self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+        self.end_headers()
+        if blob:
+            self.wfile.write(blob)
+
     def _static_file(self, rel_path: str) -> None:
         p = (WEB_ROOT / rel_path).resolve()
         if not str(p).startswith(str(WEB_ROOT.resolve())) or not p.exists() or not p.is_file():
@@ -863,6 +970,17 @@ class RealtimeHandler(BaseHTTPRequestHandler):
             try:
                 payload = self.engine.init_session(sid)
                 return self._json(200, payload)
+            except Exception as exc:
+                return self._json(500, {"ok": False, "error": str(exc)})
+        if path == "/api/realtime/frame":
+            sid = (qs.get("session_id", [""])[0] or "").strip()
+            if not sid:
+                return self._json(400, {"ok": False, "error": "missing session_id"})
+            try:
+                blob = self.engine.get_visual_frame(sid)
+                if not blob:
+                    return self._json(503, {"ok": False, "error": "frame not ready"})
+                return self._jpeg(200, blob)
             except Exception as exc:
                 return self._json(500, {"ok": False, "error": str(exc)})
         if path.startswith("/api/realtime/logs/"):

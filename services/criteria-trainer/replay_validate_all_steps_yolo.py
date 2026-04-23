@@ -239,19 +239,23 @@ def run_yolo_objects(
     object_memory: Dict[str, Dict[str, Any]],
     edge_margin: float,
     persist_max_miss_samples: int,
+    precomputed_detections: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Dict[str, float]]:
     objects: Dict[str, Dict[str, float]] = {}
     infer_targets = disambiguation_targets if disambiguation_targets else targets
-    payload = InferenceInput(
-        frame_bgr=frame_bgr,
-        timestamp_sec=sec,
-        frame_index=frame_index,
-        context={"detect_targets": infer_targets},
-    )
-    out = adapter.infer(payload)
-    detections = out.features.get("detections", [])
-    if not isinstance(detections, list):
-        detections = []
+    if isinstance(precomputed_detections, list):
+        detections = [d for d in precomputed_detections if isinstance(d, dict)]
+    else:
+        payload = InferenceInput(
+            frame_bgr=frame_bgr,
+            timestamp_sec=sec,
+            frame_index=frame_index,
+            context={"detect_targets": infer_targets},
+        )
+        out = adapter.infer(payload)
+        detections = out.features.get("detections", [])
+        if not isinstance(detections, list):
+            detections = []
     detections_by_norm: Dict[str, List[Dict[str, Any]]] = {}
     for det in detections:
         if not isinstance(det, dict):
@@ -440,6 +444,7 @@ def build_context(
     hand_adapter: Optional[MediaPipeHandAdapter],
     use_hand_model: bool,
     enable_dino_fallback: bool,
+    yolo_detections: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     objects = run_yolo_objects(
         adapter=yolo_adapter,
@@ -452,6 +457,7 @@ def build_context(
         object_memory=object_memory,
         edge_margin=persist_edge_margin,
         persist_max_miss_samples=persist_max_miss_samples,
+        precomputed_detections=yolo_detections,
     )
     detector_source = "yolo"
     if enable_dino_fallback and object_targets and len(objects) == 0:
