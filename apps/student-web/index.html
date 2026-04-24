@@ -55,8 +55,9 @@
 
       <section class="panel video-panel">
         <div class="panel-title">实时画面</div>
-        <div class="video-wrap">
+        <div id="video-stage" class="video-wrap">
           <img id="video-feed" alt="IP Webcam Stream" />
+          <canvas id="video-overlay" aria-hidden="true"></canvas>
         </div>
         <div id="server-message" class="server-message"></div>
       </section>

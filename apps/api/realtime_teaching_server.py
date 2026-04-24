@@ -1,5 +1,6 @@
 import argparse
 import base64
+import copy
 import json
 import os
 import threading
@@ -29,7 +30,28 @@ if str(ROOT) not in sys.path:
 if str(ROOT / "services" / "criteria-trainer") not in sys.path:
     sys.path.insert(0, str(ROOT / "services" / "criteria-trainer"))
 
-from config import TA_BASE_URL, TA_MODEL, TA_REQUEST_TIMEOUT_SEC, get_api_key, load_env_file  # noqa: E402
+from config import (  # noqa: E402
+    RT_DEFAULT_BOX_MAX_STALE_MS,
+    RT_DEFAULT_CAPTURE_FPS,
+    RT_DEFAULT_HAND_IN_BBOX_THRESHOLD,
+    RT_DEFAULT_IP_WEBCAM_URL,
+    RT_DEFAULT_OMNI_MODEL,
+    RT_DEFAULT_OMNI_SECTION_PASS_THRESHOLD,
+    RT_DEFAULT_PERSIST_EDGE_MARGIN,
+    RT_DEFAULT_PERSIST_MAX_MISS_SAMPLES,
+    RT_DEFAULT_RENDER_FPS,
+    RT_DEFAULT_SERVER_SIDE_OVERLAY,
+    RT_DEFAULT_STREAM_FPS,
+    RT_DEFAULT_STREAM_MAX_WIDTH,
+    RT_DEFAULT_YOLO_CONF,
+    RT_DEFAULT_YOLO_DEVICE,
+    RT_DEFAULT_YOLO_FPS,
+    RT_DEFAULT_YOLO_IOU,
+    TA_BASE_URL,
+    TA_REQUEST_TIMEOUT_SEC,
+    get_api_key,
+    load_env_file,
+)
 from adapters.mediapipe_hand import MediaPipeHandAdapter  # noqa: E402
 from adapters.yolo import YOLOAdapter  # noqa: E402
 from adapters.base import InferenceInput  # noqa: E402
@@ -76,12 +98,24 @@ def env_float(name: str, default: float) -> float:
         return float(default)
 
 
+def env_bool(name: str, default: bool) -> bool:
+    raw = env_str(name, "1" if default else "0").strip().lower()
+    return raw in {"1", "true", "yes", "y", "on"}
+
+
 class FrameSource:
     def __init__(self, base_url: str) -> None:
         self.base_url = base_url.rstrip("/")
         self.snapshot_urls = self._build_snapshot_urls(self.base_url)
         self.stream_url = self._build_stream_url(self.base_url)
-        self._capture: Optional[cv2.VideoCapture] = None
+        self.last_source_kind = "unknown"
+        self.last_frame_jpg: bytes = b""
+        self.last_frame_ts: float = 0.0
+        self._stream_client: Optional[httpx.Client] = None
+        self._stream_ctx: Any = None
+        self._stream_resp: Optional[httpx.Response] = None
+        self._stream_iter: Any = None
+        self._stream_buffer = bytearray()
 
     @staticmethod
     def _build_snapshot_urls(base_url: str) -> List[str]:
@@ -117,28 +151,99 @@ class FrameSource:
                     content_type = (resp.headers.get("content-type") or "").lower()
                     if "image" not in content_type and not url.lower().endswith((".jpg", ".jpeg")):
                         continue
-                    arr = cv2.imdecode(np.frombuffer(resp.content, dtype=np.uint8), cv2.IMREAD_COLOR)
+                    jpg = bytes(resp.content)
+                    arr = cv2.imdecode(np.frombuffer(jpg, dtype=np.uint8), cv2.IMREAD_COLOR)
                     if arr is not None:
+                        self.last_source_kind = "snapshot"
+                        self.last_frame_jpg = jpg
+                        self.last_frame_ts = time.time()
                         return arr
                 except Exception:
                     continue
         return None
 
+    def _close_stream(self) -> None:
+        try:
+            if self._stream_resp is not None:
+                self._stream_resp.close()
+        except Exception:
+            pass
+        try:
+            if self._stream_ctx is not None:
+                self._stream_ctx.__exit__(None, None, None)
+        except Exception:
+            pass
+        try:
+            if self._stream_client is not None:
+                self._stream_client.close()
+        except Exception:
+            pass
+        self._stream_client = None
+        self._stream_ctx = None
+        self._stream_resp = None
+        self._stream_iter = None
+        self._stream_buffer = bytearray()
+
+    def _ensure_stream_open(self) -> bool:
+        if self._stream_iter is not None:
+            return True
+        self._close_stream()
+        try:
+            timeout = httpx.Timeout(connect=2.0, read=2.0, write=2.0, pool=2.0)
+            self._stream_client = httpx.Client(timeout=timeout)
+            self._stream_ctx = self._stream_client.stream("GET", self.stream_url, headers={"Connection": "keep-alive"})
+            self._stream_resp = self._stream_ctx.__enter__()
+            if self._stream_resp.status_code != 200:
+                self._close_stream()
+                return False
+            self._stream_iter = self._stream_resp.iter_bytes()
+            return True
+        except Exception:
+            self._close_stream()
+            return False
+
     def _read_stream(self) -> Optional[Any]:
-        if self._capture is None or not self._capture.isOpened():
-            self._capture = cv2.VideoCapture(self.stream_url)
-        if self._capture is None or not self._capture.isOpened():
+        if not self._ensure_stream_open():
             return None
-        ok, frame = self._capture.read()
-        if not ok or frame is None:
+        try:
+            for _ in range(32):
+                chunk = next(self._stream_iter)
+                if not chunk:
+                    continue
+                self._stream_buffer.extend(chunk)
+                if len(self._stream_buffer) > 8_000_000:
+                    # Drop old backlog aggressively to avoid stale-frame queueing.
+                    self._stream_buffer = self._stream_buffer[-2_000_000:]
+                end = self._stream_buffer.rfind(b"\xff\xd9")
+                if end < 0:
+                    continue
+                start = self._stream_buffer.rfind(b"\xff\xd8", 0, end)
+                if start < 0:
+                    del self._stream_buffer[: end + 2]
+                    continue
+                jpg = bytes(self._stream_buffer[start : end + 2])
+                del self._stream_buffer[: end + 2]
+                arr = cv2.imdecode(np.frombuffer(jpg, dtype=np.uint8), cv2.IMREAD_COLOR)
+                if arr is not None:
+                    self.last_source_kind = "stream"
+                    self.last_frame_jpg = jpg
+                    self.last_frame_ts = time.time()
+                    return arr
             return None
-        return frame
+        except StopIteration:
+            self._close_stream()
+            return None
+        except Exception:
+            self._close_stream()
+            return None
 
     def read_frame(self) -> Optional[Any]:
-        frame = self._read_snapshot()
+        # Prefer continuous stream endpoint (/video) for lower request overhead.
+        frame = self._read_stream()
         if frame is not None:
             return frame
-        return self._read_stream()
+        # Fallback to snapshot endpoint when stream is temporarily unavailable.
+        return self._read_snapshot()
 
 
 def frame_to_jpeg_bytes(frame_bgr: Any, quality: int = 80) -> bytes:
@@ -146,6 +251,12 @@ def frame_to_jpeg_bytes(frame_bgr: Any, quality: int = 80) -> bytes:
     if not ok or encoded is None:
         return b""
     return bytes(encoded.tobytes())
+
+
+def blank_jpeg_bytes(width: int = 640, height: int = 360, text: str = "waiting for camera...") -> bytes:
+    canvas = np.zeros((height, width, 3), dtype=np.uint8)
+    cv2.putText(canvas, text, (20, int(height / 2)), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (180, 180, 180), 2, cv2.LINE_AA)
+    return frame_to_jpeg_bytes(canvas, quality=70)
 
 
 def jpeg_bytes_to_data_uri(blob: bytes) -> str:
@@ -172,6 +283,12 @@ class RuntimeConfig:
     yolo_conf: float
     yolo_iou: float
     yolo_device: str
+    capture_fps: float
+    render_fps: float
+    stream_fps: float
+    stream_max_width: int
+    server_side_overlay_enabled: bool
+    box_max_stale_ms: int
     persist_edge_margin: float
     persist_max_miss_samples: int
     hand_in_bbox_threshold: float
@@ -203,7 +320,15 @@ class SessionState:
     last_eval: Optional[Dict[str, Any]] = None
     last_omni: Optional[Dict[str, Any]] = None
     completed_steps: List[str] = field(default_factory=list)
-    last_visual_frame_jpg: bytes = b""
+    last_overlay_detections: List[Dict[str, Any]] = field(default_factory=list)
+    last_overlay_object_targets: List[str] = field(default_factory=list)
+    last_overlay_step_id: str = ""
+    last_overlay_matched: bool = False
+    last_overlay_ts: float = 0.0
+    last_overlay_frame_width: int = 0
+    last_overlay_frame_height: int = 0
+    latest_annotated_jpg: bytes = b""
+    last_meta_write_ts: float = 0.0
 
 
 class RealtimeTutorEngine:
@@ -227,6 +352,134 @@ class RealtimeTutorEngine:
         self.hand_adapter: Optional[MediaPipeHandAdapter] = None
         self.sessions: Dict[str, SessionState] = {}
         self._lock = threading.Lock()
+        self._latest_frame_bgr: Optional[Any] = None
+        self._latest_frame_jpg: bytes = b""
+        self._latest_frame_ts: float = 0.0
+        self._latest_frame_seq: int = 0
+        self._latest_annotated_jpg: bytes = b""
+        self._blank_jpg: bytes = blank_jpeg_bytes()
+        self._stop_event = threading.Event()
+        self._capture_thread = threading.Thread(target=self._capture_loop, name="realtime-capture", daemon=True)
+        self._infer_thread = threading.Thread(target=self._infer_loop, name="realtime-infer", daemon=True)
+        self._render_thread: Optional[threading.Thread] = None
+        self._capture_thread.start()
+        self._infer_thread.start()
+        if self.cfg.server_side_overlay_enabled:
+            self._render_thread = threading.Thread(target=self._render_loop, name="realtime-render", daemon=True)
+            self._render_thread.start()
+
+    def _capture_loop(self) -> None:
+        interval = 1.0 / max(1.0, float(self.cfg.capture_fps))
+        while not self._stop_event.is_set():
+            frame = self.frame_source.read_frame()
+            if frame is None:
+                time.sleep(0.03)
+                continue
+            jpg = self.frame_source.last_frame_jpg or frame_to_jpeg_bytes(frame, quality=70)
+            self._latest_frame_bgr = frame.copy()
+            self._latest_frame_jpg = jpg
+            self._latest_frame_ts = float(self.frame_source.last_frame_ts or time.time())
+            self._latest_frame_seq += 1
+            # Continuous MJPEG sources must be drained as fast as possible to avoid
+            # old frames backing up in socket buffers. Only throttle snapshot fallback.
+            if self.frame_source.last_source_kind != "stream":
+                time.sleep(interval)
+
+    def _infer_loop(self) -> None:
+        while not self._stop_event.is_set():
+            with self._lock:
+                session_ids = [sid for sid, s in self.sessions.items() if s.started and s.state != "course_done"]
+            if not session_ids:
+                time.sleep(0.05)
+                continue
+            for sid in session_ids:
+                try:
+                    self.evaluate_step(sid)
+                except Exception:
+                    # Keep background loop alive even if one session fails.
+                    pass
+            time.sleep(0.01)
+
+    def _render_loop(self) -> None:
+        interval = 1.0 / max(1.0, float(self.cfg.render_fps))
+        stale_sec = max(0.05, float(self.cfg.box_max_stale_ms) / 1000.0)
+        while not self._stop_event.is_set():
+            t0 = time.time()
+            raw_frame = self._get_latest_frame_copy()
+            if raw_frame is None:
+                time.sleep(0.02)
+                continue
+            frame = self._prepare_stream_frame(raw_frame)
+            can_reuse_raw_jpg = frame.shape[:2] == raw_frame.shape[:2]
+
+            with self._lock:
+                sessions = [
+                    (
+                        sid,
+                        bool(session.started),
+                        str(session.state),
+                        list(session.last_overlay_detections) if isinstance(session.last_overlay_detections, list) else [],
+                        list(session.last_overlay_object_targets) if isinstance(session.last_overlay_object_targets, list) else [],
+                        str(session.last_overlay_step_id or "-"),
+                        bool(session.last_overlay_matched),
+                        float(session.last_overlay_ts or 0.0),
+                    )
+                    for sid, session in self.sessions.items()
+                ]
+
+            now = time.time()
+            for sid, started, state, detections, targets, step_id, matched, overlay_ts in sessions:
+                if not started or state == "course_done":
+                    continue
+                fresh = (now - overlay_ts) <= stale_sec
+
+                if fresh and detections and targets:
+                    annotated = self._render_overlay_frame(
+                        frame_bgr=frame,
+                        detections=detections,
+                        object_targets=targets,
+                        matched=matched,
+                        step_id=step_id,
+                    )
+                else:
+                    annotated = self._get_latest_frame_jpg() if can_reuse_raw_jpg else frame_to_jpeg_bytes(frame, quality=70)
+                if not annotated:
+                    continue
+
+                with self._lock:
+                    s = self.sessions.get(sid)
+                    if s is not None:
+                        s.latest_annotated_jpg = annotated
+                self._latest_annotated_jpg = annotated
+
+            remain = interval - (time.time() - t0)
+            if remain > 0:
+                time.sleep(remain)
+
+    def _get_latest_frame_copy(self) -> Optional[Any]:
+        frame = self._latest_frame_bgr
+        if frame is None:
+            return None
+        return frame.copy()
+
+    def _get_latest_frame_jpg(self) -> bytes:
+        return self._latest_frame_jpg
+
+    def _get_latest_frame_seq(self) -> int:
+        return int(self._latest_frame_seq)
+
+    def _prepare_stream_frame(self, frame_bgr: Any) -> Any:
+        if frame_bgr is None:
+            return None
+        max_width = max(0, int(self.cfg.stream_max_width))
+        if max_width <= 0:
+            return frame_bgr
+        h, w = frame_bgr.shape[:2]
+        if w <= max_width:
+            return frame_bgr
+        scale = float(max_width) / float(max(1, w))
+        target_h = max(1, int(round(h * scale)))
+        return cv2.resize(frame_bgr, (max_width, target_h), interpolation=cv2.INTER_AREA)
 
     @staticmethod
     def _safe_float(v: Any, default: float = 0.0) -> float:
@@ -346,6 +599,10 @@ class RealtimeTutorEngine:
                 "runtime_config": {
                     "ip_webcam_url": self.cfg.ip_webcam_url,
                     "realtime_yolo_fps": self.cfg.realtime_yolo_fps,
+                    "realtime_capture_fps": self.cfg.capture_fps,
+                    "realtime_render_fps": self.cfg.render_fps,
+                    "realtime_stream_fps": self.cfg.stream_fps,
+                    "box_max_stale_ms": self.cfg.box_max_stale_ms,
                     "omni_section_pass_threshold": self.cfg.omni_section_pass_threshold,
                     "omni_model": self.cfg.omni_model,
                     "yolo_conf": self.cfg.yolo_conf,
@@ -354,6 +611,13 @@ class RealtimeTutorEngine:
                 },
             },
         )
+
+    def _write_session_meta_if_due(self, session: SessionState, force: bool = False) -> None:
+        now = time.time()
+        if not force and session.last_meta_write_ts > 0 and (now - session.last_meta_write_ts) < 1.0:
+            return
+        self._write_session_meta(session)
+        session.last_meta_write_ts = now
 
     def _log_event(self, session: SessionState, event: str, payload: Dict[str, Any]) -> None:
         append_jsonl(
@@ -439,9 +703,10 @@ class RealtimeTutorEngine:
     def _start_step_running(self, session: SessionState) -> None:
         sec = self._current_section(session)
         if sec is not None and len(sec.steps) == 0:
-            # Empty section should be skipped, not treated as course completion.
-            self._log_event(session, "section_auto_skip_empty", {"section_id": sec.section_id})
-            self._goto_next_section(session, reason="empty_section_auto_skip")
+            # Empty section should still go through Omni validation once.
+            session.state = "section_validating"
+            session.state_until = 0.0
+            self._log_event(session, "section_ready_for_omni_empty", {"section_id": sec.section_id})
             return
         session.state = "step_running"
         session.state_until = 0.0
@@ -451,7 +716,7 @@ class RealtimeTutorEngine:
         if step:
             self._log_event(session, "step_start", {"step_id": step.get("step_id"), "step_order": step.get("step_order")})
 
-    def _tick_state_machine(self, session: SessionState) -> None:
+    def _advance_state_machine(self, session: SessionState) -> None:
         now = time.time()
         if session.state == "chapter_intro" and now >= session.state_until:
             self._start_step_running(session)
@@ -469,6 +734,9 @@ class RealtimeTutorEngine:
             else:
                 self._start_step_running(session)
             return
+
+    def _tick_state_machine(self, session: SessionState) -> None:
+        self._advance_state_machine(session)
         if session.state == "section_validating":
             self._run_omni_section_validation(session)
             return
@@ -596,11 +864,14 @@ class RealtimeTutorEngine:
             retry_step_id = ""
         confidence = max(0.0, min(1.0, float(result.get("confidence", 0.0))))
         passed = bool(result.get("pass", False)) or (confidence >= self.cfg.omni_section_pass_threshold)
+        if not step_ids:
+            # Empty section has no retry target; still run Omni but always continue.
+            passed = True
         final = {
             "confidence": confidence,
             "pass": passed,
             "retry_step_id": (retry_step_id or None),
-            "reason": str(result.get("reason", "")),
+            "reason": str(result.get("reason", "")) if step_ids else f"{str(result.get('reason', ''))}|empty_section_forced_pass",
             "threshold": self.cfg.omni_section_pass_threshold,
         }
         session.last_omni = final
@@ -634,7 +905,7 @@ class RealtimeTutorEngine:
                     created_at=utc_now_iso(),
                 )
                 self.sessions[sid] = session
-                self._write_session_meta(session)
+                self._write_session_meta_if_due(session, force=True)
                 self._log_event(session, "session_init", {})
             return self._snapshot(session)
 
@@ -650,8 +921,16 @@ class RealtimeTutorEngine:
             session.recent_frames.clear()
             session.last_eval = None
             session.last_omni = None
+            session.last_overlay_detections = []
+            session.last_overlay_object_targets = []
+            session.last_overlay_step_id = ""
+            session.last_overlay_matched = False
+            session.last_overlay_ts = 0.0
+            session.last_overlay_frame_width = 0
+            session.last_overlay_frame_height = 0
+            session.latest_annotated_jpg = b""
             self._reset_step_runtime(session)
-            self._write_session_meta(session)
+            self._write_session_meta_if_due(session, force=True)
             self._log_event(session, "session_start", {"section": self._section_intro_payload(session)})
             return self._snapshot(session)
 
@@ -659,105 +938,143 @@ class RealtimeTutorEngine:
         return self.start_session(session_id)
 
     def evaluate_step(self, session_id: str) -> Dict[str, Any]:
+        needs_omni = False
+        step_id = ""
+        code = ""
+        object_targets: List[str] = []
+        disambiguation_targets: List[str] = []
+        use_hand_model = False
+        sample_seq = 0
+        object_memory: Dict[str, Dict[str, Any]] = {}
+        session_step_idx = -1
+
         with self._lock:
             session = self.sessions[session_id]
             if not session.started:
                 return self._snapshot(session)
 
-            self._tick_state_machine(session)
-            if session.state != "step_running":
-                self._write_session_meta(session)
+            self._advance_state_machine(session)
+            needs_omni = session.state == "section_validating"
+            if not needs_omni and session.state != "step_running":
+                self._write_session_meta_if_due(session, force=needs_omni)
                 return self._snapshot(session)
+            if needs_omni:
+                pass
+            else:
+                now = time.time()
+                interval = 1.0 / max(0.1, float(self.cfg.realtime_yolo_fps))
+                if now < session.next_sample_at:
+                    return self._snapshot(session)
+                session.next_sample_at = now + interval
 
-            now = time.time()
-            interval = 1.0 / max(0.1, float(self.cfg.realtime_yolo_fps))
-            if now < session.next_sample_at:
-                return self._snapshot(session)
-            session.next_sample_at = now + interval
+                step = self._current_step(session)
+                if not step:
+                    sec = self._current_section(session)
+                    if sec is not None and len(sec.steps) == 0:
+                        session.state = "section_validating"
+                        session.state_until = 0.0
+                        self._log_event(session, "section_ready_for_omni_empty", {"section_id": sec.section_id})
+                    else:
+                        session.state = "course_done"
+                    return self._snapshot(session)
+                step_id = str(step.get("step_id", ""))
+                plan = self._load_step_plan(step_id)
+                code_items = plan.get("judgement_conditions", [])
+                code = str(code_items[0].get("code", "")).strip() if isinstance(code_items, list) and code_items else ""
+                if not code:
+                    self._log_event(session, "step_error", {"step_id": step_id, "error": "empty_judgement_code"})
+                    return self._snapshot(session)
 
-            step = self._current_step(session)
-            if not step:
-                sec = self._current_section(session)
-                if sec is not None and len(sec.steps) == 0:
-                    self._log_event(session, "section_auto_skip_empty", {"section_id": sec.section_id})
-                    self._goto_next_section(session, reason="empty_section_auto_skip")
-                else:
-                    session.state = "course_done"
-                return self._snapshot(session)
-            step_id = str(step.get("step_id", ""))
-            plan = self._load_step_plan(step_id)
-            code_items = plan.get("judgement_conditions", [])
-            code = str(code_items[0].get("code", "")).strip() if isinstance(code_items, list) and code_items else ""
-            if not code:
-                self._log_event(session, "step_error", {"step_id": step_id, "error": "empty_judgement_code"})
-                return self._snapshot(session)
+                object_targets = extract_object_targets_from_plan(plan)
+                disambiguation_targets = list(dict.fromkeys([*object_targets, *self.global_disambiguation_targets]))
+                use_hand_model = step_requires_hand_model(plan, code)
+                sample_seq = session.step_sample_seq + 1
+                session.step_sample_seq = sample_seq
+                object_memory = copy.deepcopy(session.step_object_memory)
+                session_step_idx = int(session.step_idx)
 
-            object_targets = extract_object_targets_from_plan(plan)
-            disambiguation_targets = list(dict.fromkeys([*object_targets, *self.global_disambiguation_targets]))
-            use_hand_model = step_requires_hand_model(plan, code)
-            if use_hand_model and self.hand_adapter is None:
-                self.hand_adapter = MediaPipeHandAdapter()
-                self.hand_adapter.load()
+        if needs_omni:
+            session = self.sessions.get(session_id)
+            if session is not None:
+                self._run_omni_section_validation(session)
+                with self._lock:
+                    session = self.sessions[session_id]
+                    self._write_session_meta_if_due(session, force=True)
+                    return self._snapshot(session)
 
-            frame = self.frame_source.read_frame()
-            if frame is None:
+        if use_hand_model and self.hand_adapter is None:
+            hand_adapter = MediaPipeHandAdapter()
+            hand_adapter.load()
+            self.hand_adapter = hand_adapter
+
+        frame = self._get_latest_frame_copy()
+        if frame is None:
+            with self._lock:
+                session = self.sessions[session_id]
                 self._log_event(session, "frame_error", {"reason": "failed_to_read_frame"})
                 return self._snapshot(session)
-            session.step_sample_seq += 1
-            ts = time.time()
-            jpg = frame_to_jpeg_bytes(frame, quality=70)
-            if jpg:
-                session.recent_frames.append((ts, jpg))
+        ts = time.time()
+        latest_jpg = self._get_latest_frame_jpg()
 
-            overlay_detections = self._infer_yolo_detections(
-                frame_bgr=frame,
-                targets=disambiguation_targets,
-                frame_index=session.step_sample_seq,
-            )
+        overlay_detections = self._infer_yolo_detections(
+            frame_bgr=frame,
+            targets=disambiguation_targets,
+            frame_index=sample_seq,
+        )
 
-            ctx = build_context(
-                frame_bgr=frame,
-                frame_index=session.step_sample_seq,
-                sample_seq=session.step_sample_seq,
-                sec=ts,
-                object_targets=object_targets,
-                disambiguation_targets=disambiguation_targets,
-                anchors=self.anchors,
-                yolo_adapter=self.yolo_adapter,
-                object_memory=session.step_object_memory,
-                persist_edge_margin=self.cfg.persist_edge_margin,
-                persist_max_miss_samples=self.cfg.persist_max_miss_samples,
-                dino_adapter=None,
-                hand_adapter=self.hand_adapter if use_hand_model else None,
-                use_hand_model=use_hand_model,
-                enable_dino_fallback=False,
-                yolo_detections=overlay_detections,
-            )
-            matched = eval_condition_code(code, ctx, hand_in_bbox_threshold=self.cfg.hand_in_bbox_threshold)
-            overlay_jpg = self._render_overlay_frame(
-                frame_bgr=frame,
-                detections=overlay_detections,
-                object_targets=object_targets,
-                matched=bool(matched),
-                step_id=step_id,
-            )
-            if overlay_jpg:
-                session.last_visual_frame_jpg = overlay_jpg
-            elif jpg:
-                session.last_visual_frame_jpg = jpg
-            trace_payload = {
-                "step_id": step_id,
-                "sample_seq": session.step_sample_seq,
-                "matched": bool(matched),
-                "objects": ctx.get("objects", {}),
-                "hand_points": ctx.get("hand_points", {}),
-                "detector_source": ctx.get("detector_source", "yolo"),
-            }
+        ctx = build_context(
+            frame_bgr=frame,
+            frame_index=sample_seq,
+            sample_seq=sample_seq,
+            sec=ts,
+            object_targets=object_targets,
+            disambiguation_targets=disambiguation_targets,
+            anchors=self.anchors,
+            yolo_adapter=self.yolo_adapter,
+            object_memory=object_memory,
+            persist_edge_margin=self.cfg.persist_edge_margin,
+            persist_max_miss_samples=self.cfg.persist_max_miss_samples,
+            dino_adapter=None,
+            hand_adapter=self.hand_adapter if use_hand_model else None,
+            use_hand_model=use_hand_model,
+            enable_dino_fallback=False,
+            yolo_detections=overlay_detections,
+        )
+        matched = eval_condition_code(code, ctx, hand_in_bbox_threshold=self.cfg.hand_in_bbox_threshold)
+        filtered_detections = [d for d in overlay_detections if isinstance(d, dict)]
+        trace_payload = {
+            "step_id": step_id,
+            "sample_seq": sample_seq,
+            "matched": bool(matched),
+            "objects": ctx.get("objects", {}),
+            "hand_points": ctx.get("hand_points", {}),
+            "detector_source": ctx.get("detector_source", "yolo"),
+        }
+
+        with self._lock:
+            session = self.sessions[session_id]
+            if not session.started or session.state != "step_running":
+                return self._snapshot(session)
+            current_step = self._current_step(session)
+            current_step_id = str((current_step or {}).get("step_id", ""))
+            if current_step_id != step_id or int(session.step_idx) != session_step_idx:
+                return self._snapshot(session)
+
+            session.step_object_memory = object_memory
+            if latest_jpg:
+                session.recent_frames.append((ts, latest_jpg))
+            session.last_overlay_detections = filtered_detections
+            session.last_overlay_object_targets = [str(x) for x in object_targets]
+            session.last_overlay_step_id = step_id
+            session.last_overlay_matched = bool(matched)
+            session.last_overlay_ts = ts
+            session.last_overlay_frame_width = int(frame.shape[1]) if getattr(frame, "shape", None) is not None else 0
+            session.last_overlay_frame_height = int(frame.shape[0]) if getattr(frame, "shape", None) is not None else 0
             self._log_trace(session, trace_payload)
 
             session.last_eval = {
                 "step_id": step_id,
-                "sample_seq": session.step_sample_seq,
+                "sample_seq": sample_seq,
                 "matched": bool(matched),
                 "detector_source": ctx.get("detector_source", "yolo"),
             }
@@ -771,33 +1088,87 @@ class RealtimeTutorEngine:
                     "step_done",
                     {
                         "step_id": step_id,
-                        "sample_seq": session.step_sample_seq,
+                        "sample_seq": sample_seq,
                         "matched_at": utc_now_iso(),
                     },
                 )
 
-            self._write_session_meta(session)
+            self._write_session_meta_if_due(session, force=bool(matched))
+            return self._snapshot(session)
+
+    def poll_session(self, session_id: str) -> Dict[str, Any]:
+        with self._lock:
+            session = self.sessions[session_id]
             return self._snapshot(session)
 
     def get_visual_frame(self, session_id: str) -> bytes:
+        session = self.sessions.get(session_id)
+        if session is not None and session.latest_annotated_jpg:
+            return session.latest_annotated_jpg
+        if self._latest_annotated_jpg:
+            return self._latest_annotated_jpg
+        raw = self._get_latest_frame_jpg()
+        return raw if raw else self._blank_jpg
+
+    def get_overlay_payload(self, session_id: str) -> Dict[str, Any]:
         with self._lock:
             session = self.sessions.get(session_id)
             if session is None:
-                return b""
-            if session.last_visual_frame_jpg:
-                return session.last_visual_frame_jpg
-            frame = self.frame_source.read_frame()
-            if frame is None:
-                return b""
-            raw = frame_to_jpeg_bytes(frame, quality=75)
-            session.last_visual_frame_jpg = raw
-            return raw
+                return {"ok": False, "error": "unknown_session", "session_id": session_id}
+
+            now = time.time()
+            stale_sec = max(0.05, float(self.cfg.box_max_stale_ms) / 1000.0)
+            fresh = (now - float(session.last_overlay_ts or 0.0)) <= stale_sec
+            targets = [str(x) for x in session.last_overlay_object_targets if str(x)]
+            target_norm = {normalize_name(x) for x in targets}
+            detections: List[Dict[str, Any]] = []
+            for det in session.last_overlay_detections if isinstance(session.last_overlay_detections, list) else []:
+                if not isinstance(det, dict):
+                    continue
+                label = str(det.get("label", det.get("target", ""))).strip()
+                if not label:
+                    continue
+                if target_norm and normalize_name(label) not in target_norm:
+                    continue
+                bbox = det.get("bbox_xyxy", {})
+                if not isinstance(bbox, dict):
+                    continue
+                detections.append(
+                    {
+                        "label": label,
+                        "score": self._safe_float(det.get("score", 0.0)),
+                        "bbox_xyxy": {
+                            "x1": self._safe_float(bbox.get("x1", 0.0)),
+                            "y1": self._safe_float(bbox.get("y1", 0.0)),
+                            "x2": self._safe_float(bbox.get("x2", 0.0)),
+                            "y2": self._safe_float(bbox.get("y2", 0.0)),
+                        },
+                    }
+                )
+
+            overlay_age_ms = max(0, int((now - float(session.last_overlay_ts or 0.0)) * 1000.0))
+            capture_age_ms = max(0, int((now - float(self._latest_frame_ts or 0.0)) * 1000.0))
+            return {
+                "ok": True,
+                "session_id": session.session_id,
+                "started": session.started,
+                "state": session.state,
+                "step_id": session.last_overlay_step_id or None,
+                "matched": bool(session.last_overlay_matched),
+                "fresh": bool(fresh),
+                "overlay_age_ms": overlay_age_ms,
+                "capture_age_ms": capture_age_ms,
+                "frame_width": int(session.last_overlay_frame_width or 0),
+                "frame_height": int(session.last_overlay_frame_height or 0),
+                "object_targets": targets,
+                "detections": detections if fresh else [],
+            }
 
     def force_next_section(self, session_id: str) -> Dict[str, Any]:
         with self._lock:
             session = self.sessions[session_id]
             self._goto_next_section(session, reason="manual_next_section")
-            self._write_session_meta(session)
+            self._write_session_meta_if_due(session, force=True)
             self._log_event(session, "manual_next_section", {})
             return self._snapshot(session)
 
@@ -809,7 +1180,7 @@ class RealtimeTutorEngine:
                 return self._snapshot(session)
             session.step_idx = 0
             self._start_step_running(session)
-            self._write_session_meta(session)
+            self._write_session_meta_if_due(session, force=True)
             self._log_event(session, "manual_retry_section", {"section_id": sec.section_id})
             return self._snapshot(session)
 
@@ -817,8 +1188,10 @@ class RealtimeTutorEngine:
         with self._lock:
             session = self.sessions[session_id]
             session.state = "section_validating"
-            self._tick_state_machine(session)
-            self._write_session_meta(session)
+        self._run_omni_section_validation(session)
+        with self._lock:
+            session = self.sessions[session_id]
+            self._write_session_meta_if_due(session, force=True)
             return self._snapshot(session)
 
     def get_logs(self, session_id: str) -> Dict[str, Any]:
@@ -860,6 +1233,7 @@ class RealtimeTutorEngine:
             message = "课程完成，恭喜！"
         elif step:
             message = str((step.get("prompt") or {}).get("zh") or (step.get("prompt") or {}).get("en") or "")
+        raw_stream_url = f"/api/realtime/stream.mjpg?session_id={session.session_id}"
         return {
             "ok": True,
             "session_id": session.session_id,
@@ -868,6 +1242,9 @@ class RealtimeTutorEngine:
             "message": message,
             "video_feed_url": self.frame_source.stream_display_url(),
             "video_feed_overlay_url": f"/api/realtime/frame?session_id={session.session_id}",
+            "video_feed_stream_url": raw_stream_url,
+            "video_primary_url": raw_stream_url,
+            "overlay_meta_url": f"/api/realtime/overlay?session_id={session.session_id}",
             "section": {
                 "index": session.section_idx,
                 "count": section_count,
@@ -889,6 +1266,12 @@ class RealtimeTutorEngine:
             "is_done": is_done,
             "config": {
                 "realtime_yolo_fps": self.cfg.realtime_yolo_fps,
+                "realtime_capture_fps": self.cfg.capture_fps,
+                "realtime_render_fps": self.cfg.render_fps,
+                "realtime_stream_fps": self.cfg.stream_fps,
+                "realtime_stream_max_width": self.cfg.stream_max_width,
+                "server_side_overlay_enabled": self.cfg.server_side_overlay_enabled,
+                "box_max_stale_ms": self.cfg.box_max_stale_ms,
                 "omni_section_pass_threshold": self.cfg.omni_section_pass_threshold,
                 "omni_model": self.cfg.omni_model,
                 "yolo_conf": self.cfg.yolo_conf,
@@ -935,6 +1318,45 @@ class RealtimeHandler(BaseHTTPRequestHandler):
         if blob:
             self.wfile.write(blob)
 
+    def _stream_mjpeg(self, session_id: str) -> None:
+        boundary = "frame"
+        self.send_response(200)
+        self.send_header("Content-Type", f"multipart/x-mixed-replace; boundary={boundary}")
+        self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+        self.send_header("Pragma", "no-cache")
+        self.end_headers()
+        min_interval = 1.0 / max(1.0, float(self.engine.cfg.stream_fps))
+        last_seq = -1
+        last_sent_at = 0.0
+        while True:
+            try:
+                seq = self.engine._get_latest_frame_seq()
+                if seq <= 0 or seq == last_seq:
+                    time.sleep(0.005)
+                    continue
+                now = time.time()
+                wait = min_interval - (now - last_sent_at)
+                if wait > 0:
+                    time.sleep(wait)
+                blob = self.engine._get_latest_frame_jpg()
+                if not blob:
+                    blob = blank_jpeg_bytes()
+                head = (
+                    f"--{boundary}\r\n"
+                    f"Content-Type: image/jpeg\r\n"
+                    f"Content-Length: {len(blob)}\r\n\r\n"
+                ).encode("ascii")
+                self.wfile.write(head)
+                self.wfile.write(blob)
+                self.wfile.write(b"\r\n")
+                self.wfile.flush()
+                last_seq = seq
+                last_sent_at = time.time()
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                return
+            except Exception:
+                return
+
     def _static_file(self, rel_path: str) -> None:
         p = (WEB_ROOT / rel_path).resolve()
         if not str(p).startswith(str(WEB_ROOT.resolve())) or not p.exists() or not p.is_file():
@@ -972,17 +1394,36 @@ class RealtimeHandler(BaseHTTPRequestHandler):
                 return self._json(200, payload)
             except Exception as exc:
                 return self._json(500, {"ok": False, "error": str(exc)})
-        if path == "/api/realtime/frame":
+        if path == "/api/realtime/stream.mjpg":
+            sid = (qs.get("session_id", [""])[0] or "").strip()
+            if not sid:
+                sid = str(uuid.uuid4())
+            if sid not in self.engine.sessions:
+                self.engine.init_session(sid)
+            return self._stream_mjpeg(sid)
+        if path == "/api/realtime/overlay":
             sid = (qs.get("session_id", [""])[0] or "").strip()
             if not sid:
                 return self._json(400, {"ok": False, "error": "missing session_id"})
             try:
-                blob = self.engine.get_visual_frame(sid)
-                if not blob:
-                    return self._json(503, {"ok": False, "error": "frame not ready"})
-                return self._jpeg(200, blob)
+                payload = self.engine.get_overlay_payload(sid)
+                status = 200 if payload.get("ok") else 404
+                return self._json(status, payload)
             except Exception as exc:
                 return self._json(500, {"ok": False, "error": str(exc)})
+        if path == "/api/realtime/frame":
+            sid = (qs.get("session_id", [""])[0] or "").strip()
+            if not sid:
+                blob = blank_jpeg_bytes(text="missing session_id")
+                return self._jpeg(200, blob)
+            try:
+                blob = self.engine.get_visual_frame(sid)
+                if not blob:
+                    blob = blank_jpeg_bytes()
+                return self._jpeg(200, blob)
+            except Exception as exc:
+                blob = blank_jpeg_bytes(text=f"frame error: {str(exc)[:40]}")
+                return self._jpeg(200, blob)
         if path.startswith("/api/realtime/logs/"):
             sid = path.rsplit("/", 1)[-1].strip()
             try:
@@ -1008,7 +1449,7 @@ class RealtimeHandler(BaseHTTPRequestHandler):
                 payload = self.engine.reset_session(sid)
                 return self._json(200, payload)
             if path == "/api/realtime/step/evaluate":
-                payload = self.engine.evaluate_step(sid)
+                payload = self.engine.poll_session(sid)
                 return self._json(200, payload)
             if path == "/api/realtime/section/validate":
                 payload = self.engine.validate_section_now(sid)
@@ -1028,18 +1469,36 @@ class RealtimeHandler(BaseHTTPRequestHandler):
 def build_runtime_config(case_id: str) -> RuntimeConfig:
     return RuntimeConfig(
         case_id=case_id,
-        ip_webcam_url=env_str("IP_WEBCAM_URL", "http://127.0.0.1:8080"),
-        realtime_yolo_fps=max(0.1, env_float("REALTIME_YOLO_FPS", 2.0)),
-        omni_section_pass_threshold=max(0.0, min(1.0, env_float("OMNI_SECTION_PASS_THRESHOLD", 0.80))),
-        omni_model=env_str("OMNI_MODEL", TA_MODEL),
+        ip_webcam_url=env_str("IP_WEBCAM_URL", RT_DEFAULT_IP_WEBCAM_URL),
+        realtime_yolo_fps=max(0.1, env_float("REALTIME_YOLO_FPS", RT_DEFAULT_YOLO_FPS)),
+        omni_section_pass_threshold=max(
+            0.0,
+            min(1.0, env_float("OMNI_SECTION_PASS_THRESHOLD", RT_DEFAULT_OMNI_SECTION_PASS_THRESHOLD)),
+        ),
+        omni_model=env_str("OMNI_MODEL", RT_DEFAULT_OMNI_MODEL),
         omni_base_url=TA_BASE_URL,
         omni_timeout_sec=int(TA_REQUEST_TIMEOUT_SEC),
-        yolo_conf=max(0.01, min(0.95, env_float("REALTIME_YOLO_CONF", 0.2))),
-        yolo_iou=max(0.01, min(0.95, env_float("REALTIME_YOLO_IOU", 0.45))),
-        yolo_device=env_str("REALTIME_YOLO_DEVICE", "cuda:0"),
-        persist_edge_margin=max(0.0, min(0.3, env_float("REALTIME_PERSIST_EDGE_MARGIN", 0.05))),
-        persist_max_miss_samples=max(1, int(env_float("REALTIME_PERSIST_MAX_MISS_SAMPLES", 6))),
-        hand_in_bbox_threshold=max(0.01, min(0.5, env_float("REALTIME_HAND_IN_BBOX_THRESHOLD", 0.12))),
+        yolo_conf=max(0.01, min(0.95, env_float("REALTIME_YOLO_CONF", RT_DEFAULT_YOLO_CONF))),
+        yolo_iou=max(0.01, min(0.95, env_float("REALTIME_YOLO_IOU", RT_DEFAULT_YOLO_IOU))),
+        yolo_device=env_str("REALTIME_YOLO_DEVICE", RT_DEFAULT_YOLO_DEVICE),
+        capture_fps=max(1.0, min(60.0, env_float("REALTIME_CAPTURE_FPS", RT_DEFAULT_CAPTURE_FPS))),
+        render_fps=max(1.0, min(60.0, env_float("REALTIME_RENDER_FPS", RT_DEFAULT_RENDER_FPS))),
+        stream_fps=max(1.0, min(60.0, env_float("REALTIME_STREAM_FPS", RT_DEFAULT_STREAM_FPS))),
+        stream_max_width=max(0, int(env_float("REALTIME_STREAM_MAX_WIDTH", float(RT_DEFAULT_STREAM_MAX_WIDTH)))),
+        server_side_overlay_enabled=env_bool("REALTIME_SERVER_SIDE_OVERLAY", RT_DEFAULT_SERVER_SIDE_OVERLAY),
+        box_max_stale_ms=max(50, min(1000, int(env_float("BOX_MAX_STALE_MS", float(RT_DEFAULT_BOX_MAX_STALE_MS))))),
+        persist_edge_margin=max(
+            0.0,
+            min(0.3, env_float("REALTIME_PERSIST_EDGE_MARGIN", RT_DEFAULT_PERSIST_EDGE_MARGIN)),
+        ),
+        persist_max_miss_samples=max(
+            1,
+            int(env_float("REALTIME_PERSIST_MAX_MISS_SAMPLES", float(RT_DEFAULT_PERSIST_MAX_MISS_SAMPLES))),
+        ),
+        hand_in_bbox_threshold=max(
+            0.01,
+            min(0.5, env_float("REALTIME_HAND_IN_BBOX_THRESHOLD", RT_DEFAULT_HAND_IN_BBOX_THRESHOLD)),
+        ),
     )
 
 
@@ -1055,7 +1514,13 @@ def main() -> None:
     RealtimeHandler.engine = engine
     server = ThreadingHTTPServer((args.host, int(args.port)), RealtimeHandler)
     print(f"[INFO] realtime tutor server: http://{args.host}:{args.port}")
-    print(f"[INFO] case={args.case_id} webcam={cfg.ip_webcam_url} fps={cfg.realtime_yolo_fps}")
+    print(
+        f"[INFO] case={args.case_id} webcam={cfg.ip_webcam_url} "
+        f"capture_fps={cfg.capture_fps} yolo_fps={cfg.realtime_yolo_fps} "
+        f"render_fps={cfg.render_fps} stream_fps={cfg.stream_fps} "
+        f"stream_max_width={cfg.stream_max_width} "
+        f"server_side_overlay_enabled={cfg.server_side_overlay_enabled}"
+    )
     print(f"[INFO] omni_model={cfg.omni_model} threshold={cfg.omni_section_pass_threshold}")
     server.serve_forever()
 

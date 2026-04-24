@@ -2,8 +2,13 @@ const state = {
   sessionId: null,
   running: false,
   timer: null,
-  videoTimer: null,
+  overlayTimer: null,
   pending: false,
+  overlayPending: false,
+  overlayUrl: "",
+  overlayData: null,
+  drawQueued: false,
+  resizeObserver: null,
 };
 
 const el = {
@@ -17,13 +22,17 @@ const el = {
   stepProgress: document.getElementById("step-progress"),
   detectorSource: document.getElementById("detector-source"),
   omniResult: document.getElementById("omni-result"),
+  videoStage: document.getElementById("video-stage"),
   videoFeed: document.getElementById("video-feed"),
+  videoOverlay: document.getElementById("video-overlay"),
   serverMessage: document.getElementById("server-message"),
   btnStart: document.getElementById("btn-start"),
   btnNext: document.getElementById("btn-next"),
   btnRetry: document.getElementById("btn-retry"),
   btnReset: document.getElementById("btn-reset"),
 };
+
+const overlayCtx = el.videoOverlay.getContext("2d");
 
 function setList(target, items) {
   target.innerHTML = "";
@@ -32,6 +41,101 @@ function setList(target, items) {
     li.textContent = String(text);
     target.appendChild(li);
   });
+}
+
+function requestOverlayDraw() {
+  if (state.drawQueued) return;
+  state.drawQueued = true;
+  window.requestAnimationFrame(drawOverlay);
+}
+
+function syncOverlayCanvasSize() {
+  const rect = el.videoStage.getBoundingClientRect();
+  const cssWidth = Math.max(1, Math.round(rect.width));
+  const cssHeight = Math.max(1, Math.round(rect.height));
+  const dpr = window.devicePixelRatio || 1;
+  const pixelWidth = Math.max(1, Math.round(cssWidth * dpr));
+  const pixelHeight = Math.max(1, Math.round(cssHeight * dpr));
+
+  if (el.videoOverlay.width !== pixelWidth || el.videoOverlay.height !== pixelHeight) {
+    el.videoOverlay.width = pixelWidth;
+    el.videoOverlay.height = pixelHeight;
+  }
+  overlayCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return { width: cssWidth, height: cssHeight };
+}
+
+function getFrameRect(frameWidth, frameHeight, boxWidth, boxHeight) {
+  if (!frameWidth || !frameHeight || !boxWidth || !boxHeight) {
+    return null;
+  }
+  const scale = Math.min(boxWidth / frameWidth, boxHeight / frameHeight);
+  const width = frameWidth * scale;
+  const height = frameHeight * scale;
+  const x = (boxWidth - width) / 2;
+  const y = (boxHeight - height) / 2;
+  return { x, y, width, height };
+}
+
+function drawOverlay() {
+  state.drawQueued = false;
+  const canvasSize = syncOverlayCanvasSize();
+  overlayCtx.clearRect(0, 0, canvasSize.width, canvasSize.height);
+
+  const data = state.overlayData;
+  if (!data || !data.ok || !data.fresh) {
+    return;
+  }
+
+  const frameWidth = Number(data.frame_width || el.videoFeed.naturalWidth || 0);
+  const frameHeight = Number(data.frame_height || el.videoFeed.naturalHeight || 0);
+  const frameRect = getFrameRect(frameWidth, frameHeight, canvasSize.width, canvasSize.height);
+  if (!frameRect) {
+    return;
+  }
+
+  const detections = Array.isArray(data.detections) ? data.detections : [];
+  overlayCtx.lineWidth = 2;
+  overlayCtx.font = "600 14px 'Space Grotesk', 'Noto Sans SC', sans-serif";
+  overlayCtx.textBaseline = "top";
+
+  detections.forEach((det) => {
+    const bbox = (det && det.bbox_xyxy) || {};
+    const x1 = frameRect.x + Number(bbox.x1 || 0) * frameRect.width;
+    const y1 = frameRect.y + Number(bbox.y1 || 0) * frameRect.height;
+    const x2 = frameRect.x + Number(bbox.x2 || 0) * frameRect.width;
+    const y2 = frameRect.y + Number(bbox.y2 || 0) * frameRect.height;
+    const w = Math.max(0, x2 - x1);
+    const h = Math.max(0, y2 - y1);
+    if (!w || !h) return;
+
+    const label = String(det.label || "");
+    const score = Number(det.score || 0);
+    const text = label ? `${label} ${score.toFixed(2)}` : score.toFixed(2);
+
+    overlayCtx.strokeStyle = "#27d36f";
+    overlayCtx.fillStyle = "#27d36f";
+    overlayCtx.strokeRect(x1, y1, w, h);
+    overlayCtx.fillRect(x1, Math.max(frameRect.y, y1 - 22), Math.max(72, text.length * 8 + 10), 20);
+    overlayCtx.fillStyle = "#08111c";
+    overlayCtx.fillText(text, x1 + 5, Math.max(frameRect.y + 2, y1 - 20));
+  });
+
+  const status = data.matched ? "MATCHED" : "RUNNING";
+  const stepId = data.step_id || "-";
+  overlayCtx.fillStyle = data.matched ? "#1cd35c" : "#ffb020";
+  overlayCtx.fillRect(frameRect.x + 10, frameRect.y + 10, Math.max(136, (stepId.length + status.length) * 8 + 22), 24);
+  overlayCtx.fillStyle = "#08111c";
+  overlayCtx.fillText(`${stepId} | ${status}`, frameRect.x + 16, frameRect.y + 14);
+}
+
+function attachOverlayObservers() {
+  window.addEventListener("resize", requestOverlayDraw);
+  el.videoFeed.addEventListener("load", requestOverlayDraw);
+  if ("ResizeObserver" in window) {
+    state.resizeObserver = new ResizeObserver(() => requestOverlayDraw());
+    state.resizeObserver.observe(el.videoStage);
+  }
 }
 
 function render(snapshot) {
@@ -59,14 +163,20 @@ function render(snapshot) {
   }
   el.serverMessage.textContent = snapshot.message || "";
 
-  const overlayUrl = snapshot.video_feed_overlay_url || snapshot.video_feed_url;
-  if (overlayUrl) {
-    el.videoFeed.dataset.baseUrl = overlayUrl;
+  const videoUrl = snapshot.video_primary_url || snapshot.video_feed_url || snapshot.video_feed_stream_url || snapshot.video_feed_overlay_url;
+  if (videoUrl && el.videoFeed.dataset.streamUrl !== videoUrl) {
+    el.videoFeed.dataset.streamUrl = videoUrl;
+    el.videoFeed.src = videoUrl;
   }
+
+  state.overlayUrl = snapshot.overlay_meta_url || "";
+  requestOverlayDraw();
 
   if (snapshot.is_done) {
     state.running = false;
+    state.overlayData = null;
     stopLoop();
+    requestOverlayDraw();
   }
 }
 
@@ -129,28 +239,39 @@ async function evaluateTick() {
   }
 }
 
-function refreshVideoFrame() {
-  const baseUrl = el.videoFeed.dataset.baseUrl;
-  if (!baseUrl) return;
-  const sep = baseUrl.includes("?") ? "&" : "?";
-  el.videoFeed.src = `${baseUrl}${sep}_t=${Date.now()}`;
-}
-
-function startLoop() {
-  if (state.timer) return;
-  state.timer = setInterval(evaluateTick, 300);
-  if (!state.videoTimer) {
-    state.videoTimer = setInterval(refreshVideoFrame, 250);
+async function overlayTick() {
+  if (!state.running || state.overlayPending || !state.overlayUrl) return;
+  state.overlayPending = true;
+  try {
+    const data = await api(state.overlayUrl);
+    state.overlayData = data;
+    requestOverlayDraw();
+  } catch (err) {
+    state.overlayData = null;
+    requestOverlayDraw();
+  } finally {
+    state.overlayPending = false;
   }
 }
 
+function startLoop() {
+  if (!state.timer) {
+    state.timer = setInterval(evaluateTick, 300);
+  }
+  if (!state.overlayTimer) {
+    state.overlayTimer = setInterval(overlayTick, 100);
+  }
+  overlayTick();
+}
+
 function stopLoop() {
-  if (!state.timer) return;
-  clearInterval(state.timer);
-  state.timer = null;
-  if (state.videoTimer) {
-    clearInterval(state.videoTimer);
-    state.videoTimer = null;
+  if (state.timer) {
+    clearInterval(state.timer);
+    state.timer = null;
+  }
+  if (state.overlayTimer) {
+    clearInterval(state.overlayTimer);
+    state.overlayTimer = null;
   }
 }
 
@@ -158,6 +279,8 @@ el.btnStart.addEventListener("click", startSession);
 el.btnNext.addEventListener("click", nextSection);
 el.btnRetry.addEventListener("click", retrySection);
 el.btnReset.addEventListener("click", resetSession);
+
+attachOverlayObservers();
 
 initSession().catch((err) => {
   el.serverMessage.textContent = `初始化失败: ${err.message}`;
