@@ -35,6 +35,27 @@ python services/criteria-trainer/build_detector_plan_v2.py --case-id test_cake
 
 V3 (DINO -> YOLO acceleration):
 
+Current main path:
+
+Run entity-presence first, then train YOLO from the atomic-unit clips where each entity appears:
+
+```bash
+python services/entity-presence/label_atomic_entities.py --case-id test_cake
+python services/entity-presence/train_yolo_from_entity_presence.py --case-id test_cake --workers 0
+```
+
+This earlier stage produces the YOLO dataset, DINO bbox trace images, trained weights, and registry entry. After this is done, skip the legacy DINO bootstrap/train commands below.
+
+Main early-training outputs:
+
+- `data/<case_id>/v3/yolo-bootstrap/annotated_samples/<entity>/*.jpg`
+- `data/<case_id>/v3/yolo-bootstrap/annotation_report.json`
+- `data/<case_id>/v3/yolo-dataset/data.yaml`
+- `data/<case_id>/v3/yolo-runs/<run_id>/weights/best.pt`
+- `services/criteria-trainer/configs/yolo_registry_v1.json`
+
+Legacy path (kept for fallback/debugging):
+
 1) Bootstrap YOLO dataset from DINO pseudo labels
 
 ```bash

@@ -81,16 +81,45 @@ def dedupe_str_list(values: Any) -> List[str]:
     return out
 
 
-def get_allowed_dino_targets(scene_entity_catalog: Dict[str, Any]) -> List[str]:
+def get_allowed_object_targets(scene_entity_catalog: Dict[str, Any]) -> List[str]:
     # Source of truth: strategy scene entity catalog file.
     return dedupe_str_list(scene_entity_catalog.get("entity_names"))
+
+
+def filter_small_models_for_detector_plan(small_models: Dict[str, Any]) -> Dict[str, Any]:
+    filtered = dict(small_models)
+    models = small_models.get("models", [])
+    if isinstance(models, list):
+        filtered["models"] = [
+            m for m in models
+            if isinstance(m, dict) and str(m.get("id", "")).strip() != "grounding-dino"
+        ]
+    return filtered
+
+
+def load_yolo_entity_names(case_id: str, fallback_entities: List[str]) -> List[str]:
+    class_map_path = ROOT / "data" / case_id / "v3" / "yolo-dataset" / "class_map.json"
+    if class_map_path.exists():
+        class_map = read_json(class_map_path)
+        classes = class_map.get("classes", [])
+        names: List[str] = []
+        if isinstance(classes, list):
+            for item in classes:
+                if not isinstance(item, dict):
+                    continue
+                name = str(item.get("name", "")).strip()
+                if name and name not in names:
+                    names.append(name)
+        if names:
+            return names
+    return list(fallback_entities)
 
 
 def build_detector_user_payload(
     target_slice: Dict[str, Any],
     small_models: Dict[str, Any],
     condition_primitives: Dict[str, Any],
-    allowed_dino_detect_targets: List[str],
+    allowed_yolo_detect_targets: List[str],
     scene_entity_catalog: Dict[str, Any],
 ) -> Dict[str, Any]:
     return {
@@ -98,14 +127,25 @@ def build_detector_user_payload(
         "policy": {
             "minimal_models_only": True,
             "minimal_entities_only": True,
-            "description": "Use the minimum sufficient models to judge completion. Avoid unnecessary entities.",
-            "grounding_dino_targets_must_come_from_scene_entities": True,
+            "description": "Use the minimum sufficient models to judge completion. Avoid unnecessary entities. Object detection must use the already-trained YOLO model, not Grounding DINO.",
+            "object_detector": "yolo",
+            "grounding_dino_is_not_available": True,
+            "yolo_is_trained": True,
+            "yolo_targets_must_come_from_scene_entities": True,
         },
         "scene_entity_catalog_ref": "data/<case_id>/v2/strategy/scene_entities_v1.json",
         "scene_entity_catalog": scene_entity_catalog,
         "condition_primitives_ref": "services/criteria-trainer/configs/detection_condition_primitives_v1.json",
         "condition_primitives": condition_primitives,
-        "allowed_dino_detect_targets": allowed_dino_detect_targets,
+        "condition_primitive_runtime_note": "Primitive groups may contain legacy names such as grounding_dino, but object bbox primitives are executed against YOLO detections in the YOLO replay/realtime runtime.",
+        "allowed_yolo_detect_targets": allowed_yolo_detect_targets,
+        "yolo_capability": {
+            "status": "trained_before_detector_plan_generation",
+            "description": "YOLO has already been trained from entity-presence step clips and can localize every entity listed in allowed_yolo_detect_targets.",
+            "detectable_entities": allowed_yolo_detect_targets,
+            "class_map_ref": "data/<case_id>/v3/yolo-dataset/class_map.json",
+            "registry_ref": "services/criteria-trainer/configs/yolo_registry_v1.json",
+        },
         "slice": target_slice,
         "small_model_catalog": small_models,
         "output_schema": {
@@ -126,7 +166,7 @@ def build_detector_user_payload(
     }
 
 
-def sanitize_detector_plan(plan: Dict[str, Any], allowed_dino_targets: List[str] | None = None) -> Dict[str, Any]:
+def sanitize_detector_plan(plan: Dict[str, Any], allowed_object_targets: List[str] | None = None) -> Dict[str, Any]:
     allowed = {
         "slice_id",
         "slice_type",
@@ -137,8 +177,8 @@ def sanitize_detector_plan(plan: Dict[str, Any], allowed_dino_targets: List[str]
     }
     cleaned = {k: v for k, v in plan.items() if k in allowed}
     allowed_map: Dict[str, str] = {}
-    if isinstance(allowed_dino_targets, list):
-        for t in allowed_dino_targets:
+    if isinstance(allowed_object_targets, list):
+        for t in allowed_object_targets:
             ts = str(t).strip()
             if ts:
                 allowed_map[normalize_name(ts)] = ts
@@ -151,6 +191,8 @@ def sanitize_detector_plan(plan: Dict[str, Any], allowed_dino_targets: List[str]
             model_id = str(item.get("model_id", "")).strip()
             if not model_id:
                 continue
+            if model_id == "grounding-dino":
+                continue
             targets: List[str] = []
             if isinstance(item.get("detect_targets"), list):
                 targets = [str(x).strip() for x in item["detect_targets"] if str(x).strip()]
@@ -159,7 +201,7 @@ def sanitize_detector_plan(plan: Dict[str, Any], allowed_dino_targets: List[str]
                 targets = [x.strip() for x in re.split(r",| and ", raw) if x.strip()]
             agg.setdefault(model_id, [])
             for t in targets:
-                if model_id == "grounding-dino" and allowed_map:
+                if model_id == "yolo" and allowed_map:
                     key = normalize_name(t)
                     if key not in allowed_map:
                         continue
@@ -167,10 +209,42 @@ def sanitize_detector_plan(plan: Dict[str, Any], allowed_dino_targets: List[str]
                 if t not in agg[model_id]:
                     agg[model_id].append(t)
         cleaned["model_selection"] = [{"model_id": m, "detect_targets": ts} for m, ts in agg.items()]
+    if isinstance(cleaned.get("models_required"), list):
+        models_required: List[str] = []
+        for model_id in cleaned["models_required"]:
+            mid = str(model_id).strip()
+            if not mid or mid == "grounding-dino":
+                continue
+            if mid not in models_required:
+                models_required.append(mid)
+        cleaned["models_required"] = models_required
+    execution_plan = cleaned.get("execution_plan")
+    if isinstance(execution_plan, dict):
+        order = execution_plan.get("order")
+        if isinstance(order, list):
+            execution_plan["order"] = [
+                str(mid).strip()
+                for mid in order
+                if str(mid).strip() and str(mid).strip() != "grounding-dino"
+            ]
+        groups = execution_plan.get("parallel_groups")
+        if isinstance(groups, list):
+            clean_groups: List[List[str]] = []
+            for group in groups:
+                if not isinstance(group, list):
+                    continue
+                clean_group = [
+                    str(mid).strip()
+                    for mid in group
+                    if str(mid).strip() and str(mid).strip() != "grounding-dino"
+                ]
+                if clean_group:
+                    clean_groups.append(clean_group)
+            execution_plan["parallel_groups"] = clean_groups
     return cleaned
 
 
-def extract_grounding_dino_targets(plan: Dict[str, Any]) -> List[str]:
+def extract_object_detector_targets(plan: Dict[str, Any]) -> List[str]:
     targets: List[str] = []
     model_selection = plan.get("model_selection", [])
     if not isinstance(model_selection, list):
@@ -178,7 +252,7 @@ def extract_grounding_dino_targets(plan: Dict[str, Any]) -> List[str]:
     for item in model_selection:
         if not isinstance(item, dict):
             continue
-        if str(item.get("model_id", "")).strip() != "grounding-dino":
+        if str(item.get("model_id", "")).strip() not in {"grounding-dino", "yolo"}:
             continue
         raw_targets = item.get("detect_targets")
         if isinstance(raw_targets, list):
@@ -225,7 +299,7 @@ def validate_judgement_code(code: str, primitive_names: Set[str]) -> Tuple[bool,
     return True, ""
 
 
-def validate_plan(plan: Dict[str, Any], primitive_names: Set[str], allowed_dino_targets: List[str] | None = None) -> Tuple[bool, str]:
+def validate_plan(plan: Dict[str, Any], primitive_names: Set[str], allowed_object_targets: List[str] | None = None) -> Tuple[bool, str]:
     required = {"slice_id", "slice_type", "models_required", "model_selection", "execution_plan", "judgement_conditions"}
     missing = sorted([k for k in required if k not in plan])
     if missing:
@@ -234,10 +308,25 @@ def validate_plan(plan: Dict[str, Any], primitive_names: Set[str], allowed_dino_
         return False, "judgement_conditions must be non-empty list"
     if not isinstance(plan.get("model_selection"), list) or not plan["model_selection"]:
         return False, "model_selection must be non-empty list"
+    if not isinstance(plan.get("models_required"), list) or not plan["models_required"]:
+        return False, "models_required must be non-empty list"
+    if any(str(model_id).strip() == "grounding-dino" for model_id in plan["models_required"]):
+        return False, "grounding-dino is not available in models_required; use yolo for object localization"
+    execution_plan = plan.get("execution_plan")
+    if not isinstance(execution_plan, dict):
+        return False, "execution_plan must be object"
+    order = execution_plan.get("order", [])
+    if isinstance(order, list) and any(str(model_id).strip() == "grounding-dino" for model_id in order):
+        return False, "grounding-dino is not available in execution_plan.order; use yolo for object localization"
+    groups = execution_plan.get("parallel_groups", [])
+    if isinstance(groups, list):
+        for group in groups:
+            if isinstance(group, list) and any(str(model_id).strip() == "grounding-dino" for model_id in group):
+                return False, "grounding-dino is not available in execution_plan.parallel_groups; use yolo for object localization"
     seen_model_ids: Set[str] = set()
     allowed_map: Dict[str, str] = {}
-    if isinstance(allowed_dino_targets, list):
-        for t in allowed_dino_targets:
+    if isinstance(allowed_object_targets, list):
+        for t in allowed_object_targets:
             ts = str(t).strip()
             if ts:
                 allowed_map[normalize_name(ts)] = ts
@@ -247,6 +336,8 @@ def validate_plan(plan: Dict[str, Any], primitive_names: Set[str], allowed_dino_
         model_id = str(item.get("model_id", "")).strip()
         if not model_id:
             return False, f"model_selection[{idx}].model_id is empty"
+        if model_id == "grounding-dino":
+            return False, "grounding-dino is not available for detector plans; use yolo for object localization"
         if model_id in seen_model_ids:
             return False, f"duplicated model_id in model_selection: {model_id}"
         seen_model_ids.add(model_id)
@@ -256,10 +347,10 @@ def validate_plan(plan: Dict[str, Any], primitive_names: Set[str], allowed_dino_
         dedup_targets = [str(t).strip() for t in targets if str(t).strip()]
         if len(dedup_targets) != len(set(dedup_targets)):
             return False, f"model_selection[{idx}].detect_targets contains duplicates"
-        if model_id == "grounding-dino" and allowed_map:
+        if model_id == "yolo" and allowed_map:
             illegal = [t for t in dedup_targets if normalize_name(t) not in allowed_map]
             if illegal:
-                return False, f"model_selection[{idx}].detect_targets not in scene_entity_catalog.entity_names: {', '.join(illegal)}"
+                return False, f"model_selection[{idx}].detect_targets not in allowed YOLO entities: {', '.join(illegal)}"
     for idx, item in enumerate(plan["judgement_conditions"]):
         code = str(item.get("code", "")).strip() if isinstance(item, dict) else ""
         if not code:
@@ -353,6 +444,54 @@ def call_omni_for_detector_plan(
     raise RuntimeError("unreachable")
 
 
+def load_strategy_unit_context(case_id: str, strategy_path: Path) -> Dict[str, Dict[str, Any]]:
+    if not strategy_path.exists():
+        return {}
+    strategy = read_json(strategy_path)
+    out: Dict[str, Dict[str, Any]] = {}
+    sections = strategy.get("sections", [])
+    if not isinstance(sections, list):
+        return out
+    for section in sections:
+        if not isinstance(section, dict):
+            continue
+        section_id = str(section.get("section_id", "section_unknown"))
+        section_meta = {
+            "section_id": section_id,
+            "section_name": section.get("section_name"),
+            "section_goal": section.get("section_goal"),
+            "expected_section_state": section.get("expected_section_state"),
+            "time_range": section.get("time_range"),
+        }
+        for step in section.get("steps", []):
+            if not isinstance(step, dict):
+                continue
+            step_id = str(step.get("step_id", "")).strip()
+            unit_refs = step.get("unit_refs", [])
+            if not step_id or not isinstance(unit_refs, list):
+                continue
+            for unit_ref in unit_refs:
+                unit_id = str(unit_ref).strip()
+                if not unit_id:
+                    continue
+                out[unit_id] = {
+                    "slice_id": step_id,
+                    "slice_type": "step",
+                    "section_id": section_id,
+                    "section": section_meta,
+                    "target": {
+                        "step_id": step_id,
+                        "step_order": step.get("step_order"),
+                        "prompt": step.get("prompt"),
+                        "focus_points": step.get("focus_points", []),
+                        "common_mistakes": step.get("common_mistakes", []),
+                        "unit_refs": unit_refs,
+                    },
+                    "case_id": case_id,
+                }
+    return out
+
+
 def get_step_slices(index_data: Dict[str, Any]) -> List[Dict[str, Any]]:
     slices = index_data.get("slices", [])
     if not isinstance(slices, list):
@@ -360,6 +499,45 @@ def get_step_slices(index_data: Dict[str, Any]) -> List[Dict[str, Any]]:
     steps = [s for s in slices if s.get("slice_type") == "step"]
     steps.sort(key=lambda s: float((s.get("time_range") or {}).get("start_sec", 0.0)))
     return steps
+
+
+def get_atomic_step_slices(index_data: Dict[str, Any], unit_context: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
+    slices = index_data.get("slices", [])
+    if not isinstance(slices, list):
+        return []
+    out: List[Dict[str, Any]] = []
+    for item in slices:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("unit_class", "")).strip() != "step":
+            continue
+        unit_id = str(item.get("unit_id", "")).strip()
+        ctx = unit_context.get(unit_id, {})
+        step_id = str(ctx.get("slice_id") or unit_id).strip()
+        enriched = {
+            "slice_id": step_id,
+            "slice_type": "step",
+            "section_id": item.get("section_id"),
+            "unit_id": unit_id,
+            "time_range": item.get("time_range"),
+            "clip_path": item.get("clip_path"),
+            "section": ctx.get("section", {"section_id": item.get("section_id")}),
+            "target": ctx.get("target", {"step_id": step_id, "unit_refs": [unit_id]}),
+            "source_stage": "teaching-segmentation:atomic-unit-slicing",
+        }
+        out.append(enriched)
+    out.sort(key=lambda s: float((s.get("time_range") or {}).get("start_sec", 0.0)))
+    return out
+
+
+def resolve_clip_path(clip_path: Any) -> Path:
+    raw = Path(str(clip_path))
+    if raw.is_absolute():
+        return raw
+    parts = raw.parts
+    if parts and parts[0] == "data":
+        return (ROOT / raw).resolve()
+    return (ROOT / "data" / raw).resolve()
 
 
 def get_transcript_full_segments(transcript: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -390,6 +568,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Build detector plans for all step slices")
     parser.add_argument("--case-id", required=True)
     parser.add_argument("--slice-index", default=None)
+    parser.add_argument("--strategy", default=None, help="default data/<case_id>/v2/strategy/teaching_strategy_v2.json")
     parser.add_argument("--small-model-config", default=str(ROOT / "services" / "criteria-trainer" / "configs" / "small_models_v1.json"))
     parser.add_argument("--scene-entities-config", default=None)
     parser.add_argument("--transcript", default=None, help="path to FunASR transcript json; default data/<case_id>/v2/asr/transcript_v1.json")
@@ -410,7 +589,12 @@ def main() -> None:
         raise RuntimeError("API key missing. This script requires real Omni calls.")
 
     case_v2_dir = ROOT / "data" / args.case_id / "v2"
-    index_path = Path(args.slice_index) if args.slice_index else (case_v2_dir / "slices" / "index.json")
+    index_path = (
+        Path(args.slice_index)
+        if args.slice_index
+        else (case_v2_dir / "segmentation" / "atomic-unit-slices" / "index.json")
+    )
+    strategy_path = Path(args.strategy) if args.strategy else (case_v2_dir / "strategy" / "teaching_strategy_v2.json")
     scene_entities_path = (
         Path(args.scene_entities_config)
         if args.scene_entities_config
@@ -420,7 +604,7 @@ def main() -> None:
     output_dir = Path(args.output_dir) if args.output_dir else (case_v2_dir / "detector-plans")
 
     index_data = read_json(index_path)
-    small_models = read_json(Path(args.small_model_config))
+    small_models = filter_small_models_for_detector_plan(read_json(Path(args.small_model_config)))
     scene_entity_catalog = read_json(scene_entities_path)
     transcript = read_json(transcript_path)
     condition_primitives = read_json(CONDITION_PRIMITIVES_PATH)
@@ -428,18 +612,22 @@ def main() -> None:
     system_prompt = read_text(DETECTOR_SYSTEM_PROMPT_PATH)
     user_template = read_text(DETECTOR_USER_PROMPT_TEMPLATE_PATH)
 
-    step_slices = get_step_slices(index_data)
-    allowed_dino_targets = get_allowed_dino_targets(scene_entity_catalog)
+    unit_context = load_strategy_unit_context(args.case_id, strategy_path)
+    step_slices = get_atomic_step_slices(index_data, unit_context)
+    if not step_slices:
+        step_slices = get_step_slices(index_data)
+    allowed_object_targets = get_allowed_object_targets(scene_entity_catalog)
+    allowed_yolo_targets = load_yolo_entity_names(args.case_id, allowed_object_targets)
     if not step_slices:
         raise RuntimeError("no step slices found in index")
-    if not allowed_dino_targets:
-        raise RuntimeError("scene_entities_v1.json entity_names is empty; cannot constrain grounding-dino detect targets")
+    if not allowed_yolo_targets:
+        raise RuntimeError("no YOLO-detectable entity names found; train YOLO from entity presence first")
 
     successes: List[Dict[str, Any]] = []
     failures: List[Dict[str, Any]] = []
     all_sanitized = True
     all_codes_valid = True
-    grounding_dino_targets: Set[str] = set()
+    yolo_detect_targets: Set[str] = set()
     step_attempts = max(1, 1 + int(args.retry_invalid_times))
 
     for step in step_slices:
@@ -450,22 +638,22 @@ def main() -> None:
 
         if out_path.exists() and not args.force:
             try:
-                existing = sanitize_detector_plan(read_json(out_path), allowed_dino_targets=allowed_dino_targets)
-                ok, err = validate_plan(existing, primitive_names, allowed_dino_targets=allowed_dino_targets)
+                existing = sanitize_detector_plan(read_json(out_path), allowed_object_targets=allowed_yolo_targets)
+                ok, err = validate_plan(existing, primitive_names, allowed_object_targets=allowed_yolo_targets)
                 if ok:
-                    for t in extract_grounding_dino_targets(existing):
-                        grounding_dino_targets.add(t)
+                    for t in extract_object_detector_targets(existing):
+                        yolo_detect_targets.add(t)
                     successes.append({"slice_id": slice_id, "status": "skipped_existing", "file": str(out_path)})
                     continue
             except Exception:
                 pass
 
-        clip_path = ROOT / "data" / Path(str(step["clip_path"]))
+        clip_path = resolve_clip_path(step["clip_path"])
         payload = build_detector_user_payload(
             step,
             small_models,
             condition_primitives,
-            allowed_dino_targets,
+            allowed_yolo_targets,
             scene_entity_catalog,
         )
         payload["transcript_ref"] = str(transcript_path)
@@ -488,7 +676,7 @@ def main() -> None:
                     user_prompt=user_prompt,
                     video_uri=video_uri,
                 )
-                plan = sanitize_detector_plan(raw_plan, allowed_dino_targets=allowed_dino_targets)
+                plan = sanitize_detector_plan(raw_plan, allowed_object_targets=allowed_yolo_targets)
                 debug_attempts.append(
                     {
                         "attempt": attempt,
@@ -496,12 +684,12 @@ def main() -> None:
                         "sanitized_model_selection": plan.get("model_selection"),
                     }
                 )
-                ok, err = validate_plan(plan, primitive_names, allowed_dino_targets=allowed_dino_targets)
+                ok, err = validate_plan(plan, primitive_names, allowed_object_targets=allowed_yolo_targets)
                 if not ok:
                     all_codes_valid = False
                     raise RuntimeError(f"invalid plan: {err}")
-                for t in extract_grounding_dino_targets(plan):
-                    grounding_dino_targets.add(t)
+                for t in extract_object_detector_targets(plan):
+                    yolo_detect_targets.add(t)
                 write_json(out_path, plan)
                 successes.append(
                     {
@@ -551,7 +739,10 @@ def main() -> None:
         "failed_count": failed_count,
         "successes": successes,
         "failures": failures,
-        "grounding_dino_detect_targets": sorted(grounding_dino_targets),
+        "grounding_dino_detect_targets": sorted(yolo_detect_targets),
+        "yolo_detect_targets": sorted(yolo_detect_targets),
+        "slice_index": str(index_path),
+        "strategy": str(strategy_path),
         "consistency_checks": consistency,
     }
     write_json(output_dir / "detector_plan_v2.json", aggregate)

@@ -341,7 +341,7 @@ class RealtimeTutorEngine:
         self.sections = self._build_sections(self.strategy)
         self.global_targets = [
             str(x).strip()
-            for x in self.bundle.get("grounding_dino_detect_targets", [])
+            for x in (self.bundle.get("yolo_detect_targets") or self.bundle.get("grounding_dino_detect_targets", []))
             if str(x).strip()
         ]
         self.anchors = build_anchors_from_targets(self.global_targets)

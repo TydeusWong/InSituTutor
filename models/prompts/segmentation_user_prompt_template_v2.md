@@ -21,7 +21,28 @@ Instructions:
 4) Add top-level `video_overview` with:
    - summary
    - camera_view (single perspective label for this video)
-   - scene_entities (one merged list of all objects + environment markers used in this video; exclude body parts/person descriptors; deduplicate)
+   - scene_entities (one merged list of all objects + environment markers used in this video; exclude body parts/person descriptors; each item is one canonical identity string)
+   - For scene_entities, use DINO-friendly canonical identity strings:
+     - Format each physical entity as multiple short visual labels joined by ` . `.
+     - Recommended pattern: `core noun . color+core noun . shape/material/function+core noun`.
+     - Each short label should usually be 2-4 words.
+     - The first label should be the most stable core visual label.
+     - Examples:
+       - `blue box . cardboard box . rectangular box`
+       - `tape roll . clear tape . transparent tape`
+       - `black jar . cylindrical jar . black container`
+       - `black cap . screw cap . small lid`
+       - `wire coil . colored wires . cable bundle`
+       - `white tabletop . table surface . white surface`
+     - Prefer stable visual attributes: core category, stable color, stable shape, stable material, functional object type, and highly visible permanent parts.
+     - Avoid long descriptions and full-sentence object phrases.
+     - Avoid noisy fine details unless consistently visible and necessary.
+     - Avoid words/phrases such as `with`, `that has`, `used for`, `inner`, `printed graphics`, `threaded neck`, and `ribbed grip`.
+     - Do NOT include temporary position or changing spatial relations in entity names. Avoid names based on where the object currently is, what it is on/under/near, or which side of the workspace it occupies.
+     - One physical object must have exactly one canonical identity string across the whole JSON.
+     - Do not output aliases as separate scene_entities items; put alternate short visual labels for the same object inside the same string using ` . `.
+     - Different physical objects must have clearly separable short-label groups.
+     - Use the exact same full canonical identity string in descriptions, evidence, prompts, focus_points, and common_mistakes whenever referring to that object.
    - total_sections
    - section_atomic_counts (each section_ref + atomic_unit_count)
 5) Fill fields according to class rules:
@@ -57,3 +78,7 @@ Quality checks before returning:
 - no single `step` description/prompt contains both "remove/unscrew" and "place/move to location"
 - only pure introduction section may have zero `step`; each later procedural section must contain at least one `step`
 - avoid concentrating all steps into one section when multiple procedural phases exist
+- scene_entities names follow the `short label . short label . short label` format and are suitable for downstream DINO queries
+- no physical object has two names
+- no two distinct physical objects share a generic or ambiguous name
+- all object mentions in step/error text use the canonical scene_entities names where possible

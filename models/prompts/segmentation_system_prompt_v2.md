@@ -75,7 +75,27 @@ Field-by-field output requirements:
   - `scene_entities`: one merged list of names for all used physical objects and environment markers in this demo video.
     - Keep objects and environment markers in the SAME list.
     - Exclude any human body parts / person descriptors.
-    - Deduplicate names.
+    - Each list item is the canonical identity string for one physical entity.
+    - Format each canonical identity string as multiple short visual labels joined by ` . `:
+      `core noun . color+core noun . shape/material/function+core noun`
+    - Each short visual label should be 2-4 words when possible, optimized for visual grounding models.
+    - Put the most general stable core label first, then stable visual variants. Examples:
+      - `blue box . cardboard box . rectangular box`
+      - `tape roll . clear tape . transparent tape`
+      - `black jar . cylindrical jar . black container`
+      - `black cap . screw cap . small lid`
+      - `wire coil . colored wires . cable bundle`
+      - `white tabletop . table surface . white surface`
+    - Prefer stable visual attributes: core category, stable color, stable shape, stable material, functional object type, and highly visible permanent parts.
+    - Avoid long descriptive phrases. Do not write full-sentence object descriptions.
+    - Avoid noisy fine details unless they are consistently visible and necessary to distinguish entities.
+    - Avoid words/phrases such as `with`, `that has`, `used for`, `inner`, `printed graphics`, `threaded neck`, and `ribbed grip`.
+    - Do NOT include temporary position or changing spatial relations in entity names. Avoid names that depend on where the object currently is, what it is on/under/near, or which side of the workspace it occupies.
+    - Entity list items must be mutually exclusive: one physical object must have exactly one canonical identity string, and two different physical objects must not share the same canonical identity string.
+    - Do not create separate list items as aliases for the same object. Put alternate short visual labels for the same object inside the same string using ` . `.
+    - Different physical objects must have clearly separable short-label groups.
+    - Use the same full canonical identity string consistently everywhere in descriptions, evidence, prompts, focus_points, and common_mistakes when referring to that object.
+    - Deduplicate names after canonicalization.
   - `total_sections`: integer count of all sections in this video.
   - `section_atomic_counts`: list of objects, each with:
     - `section_ref`: section identifier text (e.g., `section_01`).
@@ -115,13 +135,15 @@ Strictness requirements:
 - Reject candidate `not_related` labels when there is evidence of object relocation/relation change aligned with actionable speech.
 - Reject outputs where a step text contains two sequential operations joined by connectors (and/then/并/然后/再). Must split into multiple steps.
 - Reject segmentation output where only one mid/late section carries almost all steps while other procedural sections have none; rebalance by refining sections.
+- Reject entity lists where one physical object has multiple names, or where two distinct physical objects are not clearly distinguishable by their names.
+- Reject generic entity names when a more detailed visible description is needed to avoid confusion in downstream detection.
 
 Output shape:
 {
   "video_overview": {
     "summary": "...",
     "camera_view": "top_down",
-    "scene_entities": ["blue box", "clear tape roll", "table black dot"],
+    "scene_entities": ["blue box . cardboard box . rectangular box", "tape roll . clear tape . transparent tape"],
     "total_sections": 0,
     "section_atomic_counts": [
       {"section_ref": "section_01", "atomic_unit_count": 1}

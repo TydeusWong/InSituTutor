@@ -1,11 +1,13 @@
 ﻿import argparse
 import json
 import re
+import shutil
+import subprocess
 import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 import httpx
 from openai import OpenAI
@@ -72,6 +74,124 @@ def resolve_video_ref(item: Dict[str, Any]) -> str:
             p = (ROOT / p).resolve()
         return str(p)
     raise ValueError("ingest item must include ingest_video_uri or ingest_video_path")
+
+
+def resolve_local_ingest_video_path(item: Dict[str, Any]) -> Path:
+    video_path = item.get("ingest_video_path")
+    if not video_path:
+        raise ValueError("ingest_video_path missing; atomic-unit slicing requires a local compressed video")
+    p = Path(str(video_path))
+    if not p.is_absolute():
+        p = (ROOT / p).resolve()
+    if not p.exists():
+        raise FileNotFoundError(f"compressed ingest video not found: {p}")
+    return p
+
+
+def normalize_time_range(time_range: Dict[str, Any]) -> Tuple[float, float]:
+    start = float(time_range.get("start_sec", 0.0) or 0.0)
+    end = float(time_range.get("end_sec", start) or start)
+    if end < start:
+        end = start
+    return start, end
+
+
+def safe_path_token(raw: Any, fallback: str) -> str:
+    token = str(raw or "").strip().lower().replace("\\", "_").replace("/", "_")
+    token = re.sub(r"[^a-z0-9_\-]+", "_", token)
+    token = re.sub(r"_{2,}", "_", token).strip("_")
+    return token or fallback
+
+
+def run_ffmpeg_cut(video_path: Path, start: float, end: float, out_file: Path) -> None:
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-ss",
+        f"{start:.3f}",
+        "-to",
+        f"{end:.3f}",
+        "-i",
+        str(video_path),
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "23",
+        "-c:a",
+        "aac",
+        str(out_file),
+    ]
+    proc = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, check=False)
+    if proc.returncode != 0:
+        raise RuntimeError(f"ffmpeg failed for {out_file}: {proc.stderr.strip()[:800]}")
+
+
+def to_rel_or_abs(path: Path) -> str:
+    try:
+        return str(path.resolve().relative_to(ROOT)).replace("\\", "/")
+    except ValueError:
+        return str(path.resolve())
+
+
+def resolve_workspace_output_dir(path: Path) -> Path:
+    resolved = path.resolve()
+    try:
+        resolved.relative_to(ROOT)
+    except ValueError as exc:
+        raise ValueError(f"atomic slices output dir must be under project root: {resolved}") from exc
+    return resolved
+
+
+def reset_atomic_slice_dir(output_dir: Path) -> None:
+    if output_dir.exists():
+        shutil.rmtree(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+
+def slice_atomic_units(
+    *,
+    case_id: str,
+    item: Dict[str, Any],
+    parsed: Dict[str, Any],
+    output_root: Path,
+) -> List[Dict[str, Any]]:
+    video_path = resolve_local_ingest_video_path(item)
+    video_token = safe_path_token(item.get("video_id"), "video")
+    slices: List[Dict[str, Any]] = []
+
+    for section in parsed.get("sections", []):
+        if not isinstance(section, dict):
+            continue
+        section_id = safe_path_token(section.get("section_id"), "section")
+
+        for unit in section.get("atomic_units", []):
+            if not isinstance(unit, dict):
+                continue
+            unit_id = safe_path_token(unit.get("unit_id"), "unit")
+            time_range = unit.get("time_range") if isinstance(unit.get("time_range"), dict) else {}
+            start, end = normalize_time_range(time_range)
+            if end <= start:
+                raise ValueError(f"invalid atomic unit time_range for {unit_id}: start={start}, end={end}")
+
+            clip_path = output_root / video_token / section_id / unit_id / "clip.mp4"
+            run_ffmpeg_cut(video_path, start, end, clip_path)
+            slices.append(
+                {
+                    "case_id": case_id,
+                    "video_id": item.get("video_id", "unknown_video"),
+                    "section_id": section.get("section_id", section_id),
+                    "unit_id": unit.get("unit_id", unit_id),
+                    "unit_class": unit.get("class", "unknown"),
+                    "time_range": {"start_sec": start, "end_sec": end},
+                    "source_video_path": to_rel_or_abs(video_path),
+                    "clip_path": to_rel_or_abs(clip_path),
+                }
+            )
+
+    return slices
 
 
 def upload_video_to_dashscope_oss(video_path: Path, api_key: str, model: str) -> str:
@@ -286,6 +406,11 @@ def main() -> None:
     parser.add_argument("--request-timeout-sec", type=int, default=TA_REQUEST_TIMEOUT_SEC)
     parser.add_argument("--max-retries", type=int, default=TA_MAX_RETRIES)
     parser.add_argument("--mock", action="store_true", help="use local mock parser and skip API")
+    parser.add_argument(
+        "--atomic-slices-dir",
+        default=None,
+        help="output directory for atomic-unit clips; default data/<case_id>/v2/segmentation/atomic-unit-slices",
+    )
     args = parser.parse_args()
 
     manifest = read_json(Path(args.manifest))
@@ -300,6 +425,13 @@ def main() -> None:
 
     case_id = args.case_id or infer_case_id_from_manifest(manifest)
     output_path = Path(args.output) if args.output else (ROOT / "data" / case_id / "v2" / "segmentation" / "sections_units.json")
+    atomic_slices_dir = (
+        Path(args.atomic_slices_dir)
+        if args.atomic_slices_dir
+        else ROOT / "data" / case_id / "v2" / "segmentation" / "atomic-unit-slices"
+    )
+    atomic_slices_dir = resolve_workspace_output_dir(atomic_slices_dir)
+    reset_atomic_slice_dir(atomic_slices_dir)
 
     out: Dict[str, Any] = {
         "pipeline_stage": "teaching-segmentation",
@@ -307,6 +439,7 @@ def main() -> None:
         "case_id": case_id,
         "demos": [],
     }
+    atomic_slice_items: List[Dict[str, Any]] = []
 
     for item in manifest.get("demos", []):
         if args.mock:
@@ -341,6 +474,15 @@ def main() -> None:
                 max_retries=args.max_retries,
             )
 
+        atomic_slice_items.extend(
+            slice_atomic_units(
+                case_id=case_id,
+                item=item,
+                parsed=parsed,
+                output_root=atomic_slices_dir,
+            )
+        )
+
         out["demos"].append(
             {
                 "task_id": item.get("task_id", "task-demo"),
@@ -356,8 +498,19 @@ def main() -> None:
             }
         )
 
+    atomic_slice_index = {
+        "pipeline_stage": "teaching-segmentation:atomic-unit-slicing",
+        "generated_at": utc_now_iso(),
+        "case_id": case_id,
+        "output_root": to_rel_or_abs(atomic_slices_dir),
+        "slice_count": len(atomic_slice_items),
+        "slices": atomic_slice_items,
+    }
+    write_json(atomic_slices_dir / "index.json", atomic_slice_index)
     write_json(output_path, out)
     print(f"[OK] output: {output_path}")
+    print(f"[OK] atomic unit slices: {atomic_slices_dir / 'index.json'}")
+    print(f"[OK] atomic unit slice count: {len(atomic_slice_items)}")
 
 
 if __name__ == "__main__":

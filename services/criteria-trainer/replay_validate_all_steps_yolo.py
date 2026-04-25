@@ -104,12 +104,79 @@ def sample_offsets_per_second(fps_int: int) -> List[int]:
 
 
 def load_step_sequence(case_id: str) -> List[Dict[str, Any]]:
-    index_path = ROOT / "data" / case_id / "v2" / "slices" / "index.json"
-    index_data = read_json(index_path)
+    case_v2_dir = ROOT / "data" / case_id / "v2"
+    atomic_index_path = case_v2_dir / "segmentation" / "atomic-unit-slices" / "index.json"
+    strategy_path = case_v2_dir / "strategy" / "teaching_strategy_v2.json"
+    legacy_index_path = case_v2_dir / "slices" / "index.json"
+
+    if atomic_index_path.exists():
+        index_data = read_json(atomic_index_path)
+        unit_to_step = load_strategy_unit_step_map(strategy_path)
+        slices = index_data.get("slices", [])
+        if not isinstance(slices, list):
+            raise RuntimeError(f"slice index missing list field slices: {atomic_index_path}")
+        steps: List[Dict[str, Any]] = []
+        for item in slices:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("unit_class", "")).strip() != "step":
+                continue
+            unit_id = str(item.get("unit_id", "")).strip()
+            step_ctx = unit_to_step.get(unit_id)
+            if not step_ctx:
+                continue
+            enriched = dict(item)
+            enriched["slice_id"] = step_ctx["step_id"]
+            enriched["slice_type"] = "step"
+            enriched["unit_id"] = unit_id
+            enriched["target"] = step_ctx.get("target", {})
+            steps.append(enriched)
+        steps.sort(key=lambda s: float((s.get("time_range") or {}).get("start_sec", 0.0)))
+        return steps
+
+    index_data = read_json(legacy_index_path)
     slices = index_data.get("slices", [])
+    if not isinstance(slices, list):
+        raise RuntimeError(f"slice index missing list field slices: {legacy_index_path}")
     steps = [s for s in slices if s.get("slice_type") == "step"]
     steps.sort(key=lambda s: float((s.get("time_range") or {}).get("start_sec", 0.0)))
     return steps
+
+
+def load_strategy_unit_step_map(strategy_path: Path) -> Dict[str, Dict[str, Any]]:
+    if not strategy_path.exists():
+        raise RuntimeError(f"strategy file not found: {strategy_path}")
+    strategy = read_json(strategy_path)
+    sections = strategy.get("sections", [])
+    if not isinstance(sections, list):
+        return {}
+    out: Dict[str, Dict[str, Any]] = {}
+    for section in sections:
+        if not isinstance(section, dict):
+            continue
+        for step in section.get("steps", []):
+            if not isinstance(step, dict):
+                continue
+            step_id = str(step.get("step_id", "")).strip()
+            unit_refs = step.get("unit_refs", [])
+            if not step_id or not isinstance(unit_refs, list):
+                continue
+            for unit_ref in unit_refs:
+                unit_id = str(unit_ref).strip()
+                if not unit_id:
+                    continue
+                out[unit_id] = {
+                    "step_id": step_id,
+                    "target": {
+                        "step_id": step_id,
+                        "step_order": step.get("step_order"),
+                        "prompt": step.get("prompt"),
+                        "focus_points": step.get("focus_points", []),
+                        "common_mistakes": step.get("common_mistakes", []),
+                        "unit_refs": unit_refs,
+                    },
+                }
+    return out
 
 
 def load_step_plan(case_id: str, step_id: str) -> Dict[str, Any]:
@@ -131,7 +198,7 @@ def extract_object_targets_from_plan(step_plan: Dict[str, Any]) -> List[str]:
     for item in model_selection:
         if not isinstance(item, dict):
             continue
-        if str(item.get("model_id", "")).strip() != "grounding-dino":
+        if str(item.get("model_id", "")).strip() not in {"grounding-dino", "yolo"}:
             continue
         if isinstance(item.get("detect_targets"), list):
             for x in item["detect_targets"]:
@@ -689,7 +756,7 @@ def run_all_steps_replay_yolo(
     video_path = resolve_video_path(case_id)
     step_slices = load_step_sequence(case_id)
     bundle = load_detector_plan_bundle(case_id)
-    global_targets = bundle.get("grounding_dino_detect_targets", [])
+    global_targets = bundle.get("yolo_detect_targets") or bundle.get("grounding_dino_detect_targets", [])
     if not isinstance(global_targets, list):
         global_targets = []
     anchors = build_anchors_from_targets([str(x).strip() for x in global_targets if str(x).strip()])
@@ -829,7 +896,7 @@ def run_all_steps_replay_yolo(
             "fps_formula": "if fps = 2n, sample frame #1 and frame #n+1 each second",
             "effective_offsets_zero_based": offsets,
         },
-        "anchors_source": "detector_plan_v2.grounding_dino_detect_targets",
+        "anchors_source": "detector_plan_v2.yolo_detect_targets",
         "anchors": anchors,
         "yolo_runtime": {
             "weights_path": str(yolo_weights),
