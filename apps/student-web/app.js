@@ -146,7 +146,7 @@ function render(snapshot) {
   const lastOmni = snapshot.last_omni || {};
 
   el.statusPill.textContent = snapshot.state || "-";
-  el.sectionName.textContent = section.section_name || "未进入章节";
+  el.sectionName.textContent = section.section_name || "Current section";
   el.sectionGoal.textContent = section.section_goal || "-";
   const zh = (step.prompt || {}).zh;
   const en = (step.prompt || {}).en;

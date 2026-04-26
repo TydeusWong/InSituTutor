@@ -16,6 +16,7 @@
   },
   "filters": {
     "min_confidence": 0.25,
+    "candidate_score_margin": 0.15,
     "min_box_area_norm": 0.0005,
     "max_box_area_norm": 0.8,
     "max_aspect_ratio": 8.0

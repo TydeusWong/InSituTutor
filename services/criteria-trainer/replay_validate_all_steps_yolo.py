@@ -21,6 +21,8 @@ from adapters.mediapipe_hand import MediaPipeHandAdapter  # noqa: E402
 from adapters.yolo import YOLOAdapter  # noqa: E402
 
 DEFAULT_REGISTRY_PATH = ROOT / "services" / "criteria-trainer" / "configs" / "yolo_registry_v1.json"
+DEFAULT_PERSIST_JUMP_DISTANCE = 0.25
+DEFAULT_PERSIST_MAX_MISS_SECONDS = 10.0
 
 
 def utc_now_iso() -> str:
@@ -261,22 +263,31 @@ def pick_candidate_least_like_others(
     candidates: List[Dict[str, Any]],
     detections_by_norm: Dict[str, List[Dict[str, Any]]],
     disambiguation_targets: List[str],
+    score_margin: float = 0.15,
 ) -> Optional[Dict[str, Any]]:
     if not candidates:
         return None
     if len(candidates) == 1:
         return candidates[0]
+    max_score = max(float(cand.get("score", 0.0)) for cand in candidates)
+    comparable = [
+        cand
+        for cand in candidates
+        if float(cand.get("score", 0.0)) >= max_score - max(0.0, float(score_margin))
+    ]
+    if not comparable:
+        comparable = candidates
     other_targets = [t for t in disambiguation_targets if normalize_name(t) != normalize_name(target)]
     if not other_targets:
-        return max(candidates, key=lambda d: float(d.get("score", 0.0)))
+        return max(comparable, key=lambda d: float(d.get("score", 0.0)))
 
     best_det: Optional[Dict[str, Any]] = None
     best_key: Optional[Tuple[float, float]] = None
-    for cand in candidates:
+    for cand in comparable:
         cand_bbox = cand.get("bbox_xyxy")
         if not isinstance(cand_bbox, dict):
             continue
-        like_other_sum = 0.0
+        like_other_max = 0.0
         for ot in other_targets:
             for od in detections_by_norm.get(normalize_name(ot), []):
                 od_bbox = od.get("bbox_xyxy")
@@ -285,14 +296,14 @@ def pick_candidate_least_like_others(
                 iou = bbox_iou(cand_bbox, od_bbox)
                 if iou <= 0.0:
                     continue
-                like_other_sum += float(od.get("score", 0.0)) * iou
-        key = (like_other_sum, -float(cand.get("score", 0.0)))
+                like_other_max = max(like_other_max, float(od.get("score", 0.0)) * iou)
+        key = (like_other_max, -float(cand.get("score", 0.0)))
         if best_key is None or key < best_key:
             best_key = key
             best_det = cand
     if isinstance(best_det, dict):
         return best_det
-    return max(candidates, key=lambda d: float(d.get("score", 0.0)))
+    return max(comparable, key=lambda d: float(d.get("score", 0.0)))
 
 
 def run_yolo_objects(
@@ -306,6 +317,7 @@ def run_yolo_objects(
     object_memory: Dict[str, Dict[str, Any]],
     edge_margin: float,
     persist_max_miss_samples: int,
+    persist_jump_distance: float = DEFAULT_PERSIST_JUMP_DISTANCE,
     precomputed_detections: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Dict[str, float]]:
     objects: Dict[str, Dict[str, float]] = {}
@@ -346,15 +358,29 @@ def run_yolo_objects(
         )
         target_hits[str(target)] = det if isinstance(det, dict) else None
 
-    detected_count = sum(1 for v in target_hits.values() if isinstance(v, dict))
-    meta = object_memory.get("__meta__")
-    if not isinstance(meta, dict):
-        meta = {}
-    prev_detected_count = int(meta.get("prev_detected_count", detected_count))
-    # New policy: occlusion persistence is triggered when detected target count drops suddenly.
-    drop_trigger = detected_count < prev_detected_count
-
     for target in targets:
+        target_key = str(target)
+        mem = object_memory.get(target_key)
+        if not isinstance(mem, dict):
+            mem = None
+
+        def persist_previous() -> bool:
+            if not isinstance(mem, dict):
+                return False
+            last_sample = int(mem.get("last_seen_sample", -10))
+            near_edge = bool(mem.get("near_edge", True))
+            if (sample_seq - last_sample) > max(1, int(persist_max_miss_samples)) or near_edge:
+                mem["persist_active"] = False
+                object_memory[target_key] = mem
+                return False
+            try:
+                register_object(objects, target, float(mem["x"]), float(mem["y"]))
+                mem["persist_active"] = True
+                object_memory[target_key] = mem
+                return True
+            except Exception:
+                return False
+
         det = target_hits.get(str(target))
         if isinstance(det, dict):
             center = det.get("center", {})
@@ -362,7 +388,16 @@ def run_yolo_objects(
                 try:
                     cx = float(center["x"])
                     cy = float(center["y"])
-                    register_object(objects, target, cx, cy)
+                    score = float(det.get("score", 0.0))
+                    if isinstance(mem, dict):
+                        prev_x = float(mem.get("x", cx))
+                        prev_y = float(mem.get("y", cy))
+                        prev_score = float(mem.get("score", 0.0))
+                        jump_distance = math.hypot(cx - prev_x, cy - prev_y)
+                        if jump_distance > float(persist_jump_distance) and score < prev_score:
+                            if persist_previous():
+                                continue
+
                     bbox = det.get("bbox_xyxy", {})
                     if isinstance(bbox, dict):
                         x1 = float(bbox.get("x1", cx))
@@ -374,9 +409,12 @@ def run_yolo_objects(
                     near_edge = (
                         x1 <= edge_margin or y1 <= edge_margin or x2 >= (1.0 - edge_margin) or y2 >= (1.0 - edge_margin)
                     )
-                    object_memory[str(target)] = {
+                    register_object(objects, target, cx, cy)
+                    object_memory[target_key] = {
                         "x": cx,
                         "y": cy,
+                        "score": score,
+                        "bbox_xyxy": {"x1": x1, "y1": y1, "x2": x2, "y2": y2},
                         "last_seen_frame": frame_index,
                         "last_seen_sample": sample_seq,
                         "near_edge": bool(near_edge),
@@ -386,28 +424,9 @@ def run_yolo_objects(
                 except Exception:
                     pass
 
-        # Miss fallback: only trigger when target count drops (occlusion sign), then keep active for limited samples.
-        mem = object_memory.get(str(target))
-        if isinstance(mem, dict):
-            last_sample = int(mem.get("last_seen_sample", -10))
-            near_edge = bool(mem.get("near_edge", True))
-            persist_active = bool(mem.get("persist_active", False))
-            can_persist = drop_trigger or persist_active
-            if can_persist and (sample_seq - last_sample) <= max(1, int(persist_max_miss_samples)) and (not near_edge):
-                try:
-                    cx = float(mem["x"])
-                    cy = float(mem["y"])
-                    register_object(objects, target, cx, cy)
-                    mem["persist_active"] = True
-                    object_memory[str(target)] = mem
-                except Exception:
-                    pass
-            else:
-                mem["persist_active"] = False
-                object_memory[str(target)] = mem
-
-    meta["prev_detected_count"] = detected_count
-    object_memory["__meta__"] = meta
+        # Per-target miss fallback: if this target was recently seen and did not
+        # leave near the frame edge, keep its last reliable position briefly.
+        persist_previous()
     return objects
 
 
@@ -908,6 +927,9 @@ def run_all_steps_replay_yolo(
             "persist_on_miss_when_not_edge": True,
             "persist_edge_margin": persist_edge_margin,
             "persist_max_miss_samples": persist_max_miss_samples,
+            "persist_max_miss_seconds": (
+                persist_max_miss_samples / max(1, len(sample_offsets_per_second(max(1, int(round(fps))))))
+            ),
         },
         "dino_fallback_runtime": {
             "enabled": bool(enable_dino_fallback),
@@ -945,7 +967,18 @@ def main() -> None:
     parser.add_argument("--progress-every-seconds", type=int, default=5)
     parser.add_argument("--hand-in-bbox-threshold", type=float, default=0.12)
     parser.add_argument("--persist-edge-margin", type=float, default=0.05)
-    parser.add_argument("--persist-max-miss-samples", type=int, default=6)
+    parser.add_argument(
+        "--persist-max-miss-seconds",
+        type=float,
+        default=DEFAULT_PERSIST_MAX_MISS_SECONDS,
+        help="default occlusion persistence duration in seconds",
+    )
+    parser.add_argument(
+        "--persist-max-miss-samples",
+        type=int,
+        default=None,
+        help="advanced override; if set, overrides --persist-max-miss-seconds",
+    )
     parser.add_argument("--output", default=None)
     args = parser.parse_args()
 
@@ -955,6 +988,19 @@ def main() -> None:
         registry_path=Path(args.yolo_registry),
     )
     yolo_class_map = Path(args.yolo_class_map) if args.yolo_class_map else (ROOT / "data" / args.case_id / "v3" / "yolo-dataset" / "class_map.json")
+    video_path = resolve_video_path(args.case_id)
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise RuntimeError(f"cannot open video: {video_path}")
+    fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+    cap.release()
+    if fps <= 0:
+        raise RuntimeError("invalid fps")
+    samples_per_second = max(1, len(sample_offsets_per_second(max(1, int(round(fps))))))
+    if args.persist_max_miss_samples is not None:
+        persist_max_miss_samples = max(1, int(args.persist_max_miss_samples))
+    else:
+        persist_max_miss_samples = max(1, int(math.ceil(max(0.1, float(args.persist_max_miss_seconds)) * samples_per_second)))
 
     result = run_all_steps_replay_yolo(
         case_id=args.case_id,
@@ -972,7 +1018,7 @@ def main() -> None:
         progress_every_seconds=max(1, int(args.progress_every_seconds)),
         hand_in_bbox_threshold=max(0.01, min(0.5, float(args.hand_in_bbox_threshold))),
         persist_edge_margin=max(0.0, min(0.3, float(args.persist_edge_margin))),
-        persist_max_miss_samples=max(1, int(args.persist_max_miss_samples)),
+        persist_max_miss_samples=persist_max_miss_samples,
     )
 
     out_path = Path(args.output) if args.output else (ROOT / "data" / args.case_id / "v3" / "replay-validation-yolo" / "all_steps_result.json")

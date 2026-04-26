@@ -2,6 +2,7 @@ import argparse
 import base64
 import copy
 import json
+import math
 import os
 import threading
 import time
@@ -38,7 +39,7 @@ from config import (  # noqa: E402
     RT_DEFAULT_OMNI_MODEL,
     RT_DEFAULT_OMNI_SECTION_PASS_THRESHOLD,
     RT_DEFAULT_PERSIST_EDGE_MARGIN,
-    RT_DEFAULT_PERSIST_MAX_MISS_SAMPLES,
+    RT_DEFAULT_PERSIST_MAX_MISS_SECONDS,
     RT_DEFAULT_RENDER_FPS,
     RT_DEFAULT_SERVER_SIDE_OVERLAY,
     RT_DEFAULT_STREAM_FPS,
@@ -290,6 +291,7 @@ class RuntimeConfig:
     server_side_overlay_enabled: bool
     box_max_stale_ms: int
     persist_edge_margin: float
+    persist_max_miss_seconds: float
     persist_max_miss_samples: int
     hand_in_bbox_threshold: float
 
@@ -608,6 +610,8 @@ class RealtimeTutorEngine:
                     "yolo_conf": self.cfg.yolo_conf,
                     "yolo_iou": self.cfg.yolo_iou,
                     "yolo_device": self.cfg.yolo_device,
+                    "persist_max_miss_seconds": self.cfg.persist_max_miss_seconds,
+                    "persist_max_miss_samples": self.cfg.persist_max_miss_samples,
                 },
             },
         )
@@ -1277,6 +1281,7 @@ class RealtimeTutorEngine:
                 "yolo_conf": self.cfg.yolo_conf,
                 "yolo_iou": self.cfg.yolo_iou,
                 "persist_edge_margin": self.cfg.persist_edge_margin,
+                "persist_max_miss_seconds": self.cfg.persist_max_miss_seconds,
                 "persist_max_miss_samples": self.cfg.persist_max_miss_samples,
             },
         }
@@ -1467,10 +1472,15 @@ class RealtimeHandler(BaseHTTPRequestHandler):
 
 
 def build_runtime_config(case_id: str) -> RuntimeConfig:
+    realtime_yolo_fps = max(0.1, env_float("REALTIME_YOLO_FPS", RT_DEFAULT_YOLO_FPS))
+    persist_max_miss_seconds = max(
+        0.1,
+        env_float("REALTIME_PERSIST_MAX_MISS_SECONDS", RT_DEFAULT_PERSIST_MAX_MISS_SECONDS),
+    )
     return RuntimeConfig(
         case_id=case_id,
         ip_webcam_url=env_str("IP_WEBCAM_URL", RT_DEFAULT_IP_WEBCAM_URL),
-        realtime_yolo_fps=max(0.1, env_float("REALTIME_YOLO_FPS", RT_DEFAULT_YOLO_FPS)),
+        realtime_yolo_fps=realtime_yolo_fps,
         omni_section_pass_threshold=max(
             0.0,
             min(1.0, env_float("OMNI_SECTION_PASS_THRESHOLD", RT_DEFAULT_OMNI_SECTION_PASS_THRESHOLD)),
@@ -1491,10 +1501,8 @@ def build_runtime_config(case_id: str) -> RuntimeConfig:
             0.0,
             min(0.3, env_float("REALTIME_PERSIST_EDGE_MARGIN", RT_DEFAULT_PERSIST_EDGE_MARGIN)),
         ),
-        persist_max_miss_samples=max(
-            1,
-            int(env_float("REALTIME_PERSIST_MAX_MISS_SAMPLES", float(RT_DEFAULT_PERSIST_MAX_MISS_SAMPLES))),
-        ),
+        persist_max_miss_seconds=persist_max_miss_seconds,
+        persist_max_miss_samples=max(1, int(math.ceil(persist_max_miss_seconds * realtime_yolo_fps))),
         hand_in_bbox_threshold=max(
             0.01,
             min(0.5, env_float("REALTIME_HAND_IN_BBOX_THRESHOLD", RT_DEFAULT_HAND_IN_BBOX_THRESHOLD)),

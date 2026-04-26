@@ -232,24 +232,36 @@ def pick_candidate_least_like_others(
     target: str,
     candidates: List[Dict[str, Any]],
     detections_by_target: Dict[str, List[Dict[str, Any]]],
+    score_margin: float = 0.15,
 ) -> Dict[str, Any]:
     if len(candidates) <= 1:
         return candidates[0]
+    max_score = max(float(cand.get("score", 0.0)) for cand in candidates)
+    comparable = [
+        cand
+        for cand in candidates
+        if float(cand.get("score", 0.0)) >= max_score - max(0.0, float(score_margin))
+    ]
+    if not comparable:
+        comparable = candidates
     best_det = None
     best_key = None
-    for cand in candidates:
+    for cand in comparable:
         cand_bbox = cand.get("bbox_xyxy")
         if not isinstance(cand_bbox, dict):
             continue
-        like_other_sum = 0.0
+        like_other_max = 0.0
         for other_target, other_dets in detections_by_target.items():
             if other_target == target:
                 continue
             for other_det in other_dets:
                 other_bbox = other_det.get("bbox_xyxy")
                 if isinstance(other_bbox, dict):
-                    like_other_sum += float(other_det.get("score", 0.0)) * bbox_iou(cand_bbox, other_bbox)
-        key = (like_other_sum, -float(cand.get("score", 0.0)))
+                    like_other_max = max(
+                        like_other_max,
+                        float(other_det.get("score", 0.0)) * bbox_iou(cand_bbox, other_bbox),
+                    )
+        key = (like_other_max, -float(cand.get("score", 0.0)))
         if best_key is None or key < best_key:
             best_key = key
             best_det = cand
@@ -319,6 +331,7 @@ def build_dataset_from_presence(
     min_area = float(filter_cfg.get("min_box_area_norm", 0.0005))
     max_area = float(filter_cfg.get("max_box_area_norm", 0.8))
     max_ar = float(filter_cfg.get("max_aspect_ratio", 8.0))
+    candidate_score_margin = float(filter_cfg.get("candidate_score_margin", 0.15))
 
     dino_box_th = float(dino_cfg.get("box_threshold", 0.3))
     dino_text_th = float(dino_cfg.get("text_threshold", 0.25))
@@ -471,7 +484,12 @@ def build_dataset_from_presence(
                     per_target_stats[target]["rejected"]["missing_detection"] += 1
                     write_json(filtered_root / target / f"{frame_key}.json", filtered_out)
                     continue
-                det = pick_candidate_least_like_others(target, cands, detections_by_target)
+                det = pick_candidate_least_like_others(
+                    target,
+                    cands,
+                    detections_by_target,
+                    score_margin=candidate_score_margin,
+                )
                 score = float(det.get("score", 0.0))
                 bbox = det.get("bbox_xyxy")
                 if not isinstance(bbox, dict):
@@ -731,7 +749,7 @@ def train_yolo(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Early DINO bootstrap and YOLO training from entity-presence step clips")
+    parser = argparse.ArgumentParser(description="Run DINO bootstrap from entity-presence step clips")
     parser.add_argument("--case-id", required=True)
     parser.add_argument("--entity-presence", default=None, help="default data/<case_id>/v2/segmentation/entity-presence/entity_presence.json")
     parser.add_argument("--config", default=str(DEFAULT_BOOTSTRAP_CONFIG))
@@ -749,7 +767,11 @@ def main() -> None:
     parser.add_argument("--workers", type=int, default=0)
     parser.add_argument("--amp", action="store_true", default=False)
     parser.add_argument("--plots", action="store_true", default=False)
-    parser.add_argument("--skip-train", action="store_true", help="only build DINO-labeled YOLO dataset and bbox trace images")
+    parser.add_argument(
+        "--train-after-bootstrap",
+        action="store_true",
+        help="also train YOLO immediately after DINO bootstrap; default is DINO labeling only",
+    )
     args = parser.parse_args()
 
     cfg = read_json(Path(args.config))
@@ -773,7 +795,7 @@ def main() -> None:
     )
 
     train_entry = None
-    if not args.skip_train:
+    if args.train_after_bootstrap:
         train_entry = train_yolo(
             case_id=args.case_id,
             cfg=cfg,
@@ -790,7 +812,11 @@ def main() -> None:
         )
 
     summary = {
-        "pipeline_stage": "entity-presence:dino-bootstrap-yolo-train",
+        "pipeline_stage": (
+            "entity-presence:dino-bootstrap-yolo-train"
+            if args.train_after_bootstrap
+            else "entity-presence:dino-bootstrap"
+        ),
         "generated_at": utc_now_iso(),
         "case_id": args.case_id,
         "entity_presence": to_rel_or_abs(presence_path),

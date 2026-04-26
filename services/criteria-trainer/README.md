@@ -33,49 +33,37 @@ python services/criteria-trainer/slice_step_error_clips.py --case-id test_cake
 python services/criteria-trainer/build_detector_plan_v2.py --case-id test_cake
 ```
 
-V3 (DINO -> YOLO acceleration):
+V3 (Entity presence -> DINO -> Omni validation -> YOLO acceleration):
 
 Current main path:
 
-Run entity-presence first, then train YOLO from the atomic-unit clips where each entity appears:
+1) Label which entities are visually present in each atomic-unit clip
 
 ```bash
 python services/entity-presence/label_atomic_entities.py --case-id test_cake
+```
+
+2) Run DINO bootstrap and write bbox trace images. This does not train YOLO by default.
+
+```bash
 python services/entity-presence/train_yolo_from_entity_presence.py --case-id test_cake --workers 0
 ```
 
-This earlier stage produces the YOLO dataset, DINO bbox trace images, trained weights, and registry entry. After this is done, skip the legacy DINO bootstrap/train commands below.
-
-Main early-training outputs:
-
-- `data/<case_id>/v3/yolo-bootstrap/annotated_samples/<entity>/*.jpg`
-- `data/<case_id>/v3/yolo-bootstrap/annotation_report.json`
-- `data/<case_id>/v3/yolo-dataset/data.yaml`
-- `data/<case_id>/v3/yolo-runs/<run_id>/weights/best.pt`
-- `services/criteria-trainer/configs/yolo_registry_v1.json`
-
-Legacy path (kept for fallback/debugging):
-
-1) Bootstrap YOLO dataset from DINO pseudo labels
+3) Ask Omni to validate each DINO bbox overlay image as yes/no
 
 ```bash
-python services/criteria-trainer/bootstrap_yolo_dataset_from_dino.py \
-  --case-id test_cake \
-  --dino-model-id models/small-models/object/grounding-dino \
-  --dino-processor-id models/small-models/object/grounding-dino
+python services/entity-presence/validate_dino_annotations_with_omni.py --case-id test_cake
 ```
 
-2) Train YOLO from bootstrap dataset
+4) Train YOLO only from Omni-accepted DINO labels
 
 ```bash
-python services/criteria-trainer/train_yolo_from_bootstrap.py \
-  --case-id test_cake \
-  --base-model models/small-models/object/yolo/yolo11n.pt \
-  --device cuda:0 \
-  --workers 0
+python services/entity-presence/train_yolo_from_validated_dino.py --case-id test_cake --workers 0
 ```
 
-3) Replay validate with YOLO-first and optional DINO fallback
+Legacy DINO bootstrap/train scripts are kept for fallback/debugging, but the main path above should be used.
+
+5) Replay validate with YOLO-first and optional DINO fallback
 
 ```bash
 python services/criteria-trainer/replay_validate_all_steps_yolo.py \
