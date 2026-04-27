@@ -4,6 +4,9 @@ import copy
 import json
 import math
 import os
+import re
+import shutil
+import subprocess
 import threading
 import time
 import uuid
@@ -42,6 +45,7 @@ from config import (  # noqa: E402
     RT_DEFAULT_PERSIST_MAX_MISS_SECONDS,
     RT_DEFAULT_RENDER_FPS,
     RT_DEFAULT_SERVER_SIDE_OVERLAY,
+    RT_DEFAULT_SKIP_OMNI_VALIDATION,
     RT_DEFAULT_STREAM_FPS,
     RT_DEFAULT_STREAM_MAX_WIDTH,
     RT_DEFAULT_YOLO_CONF,
@@ -260,6 +264,34 @@ def blank_jpeg_bytes(width: int = 640, height: int = 360, text: str = "waiting f
     return frame_to_jpeg_bytes(canvas, quality=70)
 
 
+def load_ingest_video_meta(case_id: str) -> Dict[str, Any]:
+    manifest_path = ROOT / "data" / case_id / "ingest_manifest.json"
+    if not manifest_path.exists():
+        return {"target_width": 1280, "target_height": 720, "target_fps": 10.0, "ingest_video_path": ""}
+    data = read_json(manifest_path)
+    demos = data.get("demos", [])
+    demo = demos[0] if isinstance(demos, list) and demos else {}
+    resolution = str(demo.get("resolution", "1280x720")).lower().strip()
+    width, height = 1280, 720
+    if "x" in resolution:
+        left, right = resolution.split("x", 1)
+        try:
+            width = int(float(left.strip()))
+            height = int(float(right.strip()))
+        except Exception:
+            width, height = 1280, 720
+    try:
+        fps = float(demo.get("fps", 10.0))
+    except Exception:
+        fps = 10.0
+    return {
+        "target_width": width,
+        "target_height": height,
+        "target_fps": fps,
+        "ingest_video_path": str(demo.get("ingest_video_path", "")),
+    }
+
+
 def jpeg_bytes_to_data_uri(blob: bytes) -> str:
     return "data:image/jpeg;base64," + base64.b64encode(blob).decode("ascii")
 
@@ -275,9 +307,13 @@ def extract_json_from_text(text: str) -> Dict[str, Any]:
 @dataclass
 class RuntimeConfig:
     case_id: str
+    mode: str
+    strategy_version: str
+    error_library: str
     ip_webcam_url: str
     realtime_yolo_fps: float
     omni_section_pass_threshold: float
+    skip_omni_validation: bool
     omni_model: str
     omni_base_url: str
     omni_timeout_sec: int
@@ -294,6 +330,10 @@ class RuntimeConfig:
     persist_max_miss_seconds: float
     persist_max_miss_samples: int
     hand_in_bbox_threshold: float
+    target_width: int
+    target_height: int
+    target_fps: float
+    ingest_video_path: str
 
 
 @dataclass
@@ -321,6 +361,7 @@ class SessionState:
     next_sample_at: float = 0.0
     last_eval: Optional[Dict[str, Any]] = None
     last_omni: Optional[Dict[str, Any]] = None
+    last_error: Optional[Dict[str, Any]] = None
     completed_steps: List[str] = field(default_factory=list)
     last_overlay_detections: List[Dict[str, Any]] = field(default_factory=list)
     last_overlay_object_targets: List[str] = field(default_factory=list)
@@ -331,6 +372,18 @@ class SessionState:
     last_overlay_frame_height: int = 0
     latest_annotated_jpg: bytes = b""
     last_meta_write_ts: float = 0.0
+    self_evolution_recording_enabled: bool = False
+    capture_meta: Dict[str, Any] = field(default_factory=dict)
+    started_at_monotonic: float = 0.0
+    ended_at: str = ""
+    raw_media_path: str = ""
+    raw_audio_path: str = ""
+    raw_video_path: str = ""
+    review_media_path: str = ""
+    review_media_error: str = ""
+    record_stop_event: Optional[threading.Event] = None
+    record_thread: Optional[threading.Thread] = None
+    recorded_frame_count: int = 0
 
 
 class RealtimeTutorEngine:
@@ -338,7 +391,8 @@ class RealtimeTutorEngine:
         self.cfg = cfg
         self.api_key = get_api_key()
         self.frame_source = FrameSource(cfg.ip_webcam_url)
-        self.strategy = read_json(ROOT / "data" / cfg.case_id / "v2" / "strategy" / "teaching_strategy_v2.json")
+        self.strategy_path = self._resolve_strategy_path()
+        self.strategy = read_json(self.strategy_path)
         self.bundle = read_json(ROOT / "data" / cfg.case_id / "v2" / "detector-plans" / "detector_plan_v2.json")
         self.sections = self._build_sections(self.strategy)
         self.global_targets = [
@@ -350,6 +404,7 @@ class RealtimeTutorEngine:
         self.global_disambiguation_targets = [
             t for t in self.global_targets if normalize_name(t) not in {"workspace center", "workspace_center"}
         ]
+        self.error_plans_by_step = self._load_error_plans_by_step()
         self.yolo_adapter = self._load_yolo_adapter(cfg.case_id)
         self.hand_adapter: Optional[MediaPipeHandAdapter] = None
         self.sessions: Dict[str, SessionState] = {}
@@ -369,6 +424,42 @@ class RealtimeTutorEngine:
         if self.cfg.server_side_overlay_enabled:
             self._render_thread = threading.Thread(target=self._render_loop, name="realtime-render", daemon=True)
             self._render_thread.start()
+
+    def _resolve_strategy_path(self) -> Path:
+        if self.cfg.strategy_version == "evolved":
+            path = ROOT / "data" / self.cfg.case_id / "v5" / "strategy" / "teaching_strategy_evolved_v1.json"
+            if path.exists():
+                return path
+            raise FileNotFoundError(f"missing evolved strategy: {path}")
+        return ROOT / "data" / self.cfg.case_id / "v2" / "strategy" / "teaching_strategy_v2.json"
+
+    def _load_error_plans_by_step(self) -> Dict[str, List[Dict[str, Any]]]:
+        if self.cfg.error_library == "none":
+            return {}
+        library_path = ROOT / "data" / self.cfg.case_id / "v5" / "errors" / "error_library_v1.json"
+        if not library_path.exists():
+            return {}
+        library = read_json(library_path)
+        by_step: Dict[str, List[Dict[str, Any]]] = {}
+        for item in library.get("errors", []) if isinstance(library.get("errors"), list) else []:
+            if not isinstance(item, dict):
+                continue
+            plan_value = str(item.get("plan_path", "")).strip()
+            if not plan_value:
+                continue
+            plan_path = Path(plan_value)
+            if not plan_path.is_absolute():
+                plan_path = ROOT / plan_path
+            if not plan_path.exists():
+                continue
+            plan = read_json(plan_path)
+            scope = plan.get("scope") if isinstance(plan.get("scope"), dict) else item.get("scope", {})
+            if not isinstance(scope, dict):
+                scope = {}
+            steps = [str(x).strip() for x in scope.get("applies_to_steps", []) if str(x).strip()]
+            for step_id in steps:
+                by_step.setdefault(step_id, []).append(plan)
+        return by_step
 
     def _capture_loop(self) -> None:
         interval = 1.0 / max(1.0, float(self.cfg.capture_fps))
@@ -574,8 +665,20 @@ class RealtimeTutorEngine:
     def _session_dir(self, session: SessionState) -> Path:
         return ROOT / "data" / session.case_id / "v4" / "realtime-logs" / session.session_id
 
+    def _self_evolution_session_dir(self, session: SessionState) -> Path:
+        return ROOT / "data" / session.case_id / "v5" / "sessions" / session.session_id
+
+    def _self_evolution_logs_dir(self, session: SessionState) -> Path:
+        return self._self_evolution_session_dir(session) / "logs"
+
+    def _self_evolution_raw_dir(self, session: SessionState) -> Path:
+        return self._self_evolution_session_dir(session) / "raw"
+
     def _session_meta_path(self, session: SessionState) -> Path:
         return self._session_dir(session) / "session_meta.json"
+
+    def _self_evolution_session_meta_path(self, session: SessionState) -> Path:
+        return self._self_evolution_logs_dir(session) / "session_meta.json"
 
     def _events_path(self, session: SessionState) -> Path:
         return self._session_dir(session) / "events.jsonl"
@@ -586,35 +689,191 @@ class RealtimeTutorEngine:
     def _trace_path(self, session: SessionState) -> Path:
         return self._session_dir(session) / "step_trace.jsonl"
 
-    def _write_session_meta(self, session: SessionState) -> None:
-        write_json(
-            self._session_meta_path(session),
-            {
-                "session_id": session.session_id,
-                "case_id": session.case_id,
-                "created_at": session.created_at,
-                "updated_at": utc_now_iso(),
-                "state": session.state,
-                "section_idx": session.section_idx,
-                "step_idx": session.step_idx,
-                "started": session.started,
-                "runtime_config": {
-                    "ip_webcam_url": self.cfg.ip_webcam_url,
-                    "realtime_yolo_fps": self.cfg.realtime_yolo_fps,
-                    "realtime_capture_fps": self.cfg.capture_fps,
-                    "realtime_render_fps": self.cfg.render_fps,
-                    "realtime_stream_fps": self.cfg.stream_fps,
-                    "box_max_stale_ms": self.cfg.box_max_stale_ms,
-                    "omni_section_pass_threshold": self.cfg.omni_section_pass_threshold,
-                    "omni_model": self.cfg.omni_model,
-                    "yolo_conf": self.cfg.yolo_conf,
-                    "yolo_iou": self.cfg.yolo_iou,
-                    "yolo_device": self.cfg.yolo_device,
-                    "persist_max_miss_seconds": self.cfg.persist_max_miss_seconds,
-                    "persist_max_miss_samples": self.cfg.persist_max_miss_samples,
-                },
-            },
+    def _self_evolution_path(self, session: SessionState, name: str) -> Path:
+        return self._self_evolution_logs_dir(session) / name
+
+    def _session_elapsed_sec(self, session: SessionState) -> float:
+        if session.started_at_monotonic <= 0:
+            return 0.0
+        return max(0.0, time.time() - session.started_at_monotonic)
+
+    def _prepare_self_evolution_session(self, session: SessionState) -> None:
+        base = self._self_evolution_session_dir(session)
+        for rel in [
+            "raw",
+            "logs",
+            "asr",
+            "alignment",
+            "reflection",
+            "error-slices",
+            "detector-plans/errors",
+            "review",
+        ]:
+            (base / rel).mkdir(parents=True, exist_ok=True)
+        for name in ["events.jsonl", "step_trace.jsonl", "omni_calls.jsonl", "system_prompts.jsonl", "teacher_interventions.jsonl"]:
+            p = self._self_evolution_path(session, name)
+            if not p.exists():
+                p.write_text("", encoding="utf-8")
+
+    def _start_ipcam_recording(self, session: SessionState) -> None:
+        if session.record_thread is not None and session.record_thread.is_alive():
+            return
+        raw_dir = self._self_evolution_raw_dir(session)
+        raw_dir.mkdir(parents=True, exist_ok=True)
+        video_path = raw_dir / "teaching_session_ipcam.mp4"
+        stop_event = threading.Event()
+        session.record_stop_event = stop_event
+        session.raw_video_path = str(video_path.relative_to(ROOT))
+        session.recorded_frame_count = 0
+        thread = threading.Thread(
+            target=self._record_ipcam_loop,
+            args=(session.session_id, video_path, stop_event),
+            name=f"self-evolution-record-{session.session_id}",
+            daemon=True,
         )
+        session.record_thread = thread
+        thread.start()
+
+    def _record_ipcam_loop(self, session_id: str, video_path: Path, stop_event: threading.Event) -> None:
+        fps = max(1.0, float(self.cfg.target_fps or self.cfg.capture_fps or 10.0))
+        width = max(1, int(self.cfg.target_width or 1280))
+        height = max(1, int(self.cfg.target_height or 720))
+        writer = cv2.VideoWriter(str(video_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
+        interval = 1.0 / fps
+        next_at = time.time()
+        frame_count = 0
+        try:
+            while not stop_event.is_set():
+                now = time.time()
+                if now < next_at:
+                    time.sleep(min(0.02, next_at - now))
+                    continue
+                next_at += interval
+                frame = self._get_latest_frame_copy()
+                if frame is None:
+                    continue
+                if frame.shape[1] != width or frame.shape[0] != height:
+                    frame = cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
+                writer.write(frame)
+                frame_count += 1
+                with self._lock:
+                    session = self.sessions.get(session_id)
+                    if session is not None:
+                        session.recorded_frame_count = frame_count
+        finally:
+            writer.release()
+
+    def _stop_ipcam_recording(self, session: SessionState) -> None:
+        stop_event = session.record_stop_event
+        thread = session.record_thread
+        if stop_event is not None:
+            stop_event.set()
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=3.0)
+        session.record_stop_event = None
+        session.record_thread = None
+
+    def _build_review_media(self, session: SessionState) -> None:
+        session.review_media_path = ""
+        session.review_media_error = ""
+        video_path = ROOT / session.raw_video_path if session.raw_video_path else None
+        audio_path = ROOT / session.raw_audio_path if session.raw_audio_path else None
+        if video_path is None or not video_path.exists():
+            session.review_media_error = "missing_ipcam_video"
+            return
+        if audio_path is None or not audio_path.exists():
+            session.review_media_error = "missing_microphone_audio"
+            return
+        out_path = self._self_evolution_raw_dir(session) / "teaching_session_review.mp4"
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(video_path),
+            "-i",
+            str(audio_path),
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-shortest",
+            str(out_path),
+        ]
+        proc = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, check=False)
+        if proc.returncode != 0:
+            session.review_media_error = proc.stderr.strip()[:800] or "ffmpeg_mux_failed"
+            return
+        session.review_media_path = str(out_path.relative_to(ROOT))
+
+    def _write_session_meta(self, session: SessionState) -> None:
+        actual_width = int(session.capture_meta.get("actual_width") or session.capture_meta.get("width") or 0)
+        actual_height = int(session.capture_meta.get("actual_height") or session.capture_meta.get("height") or 0)
+        actual_fps = float(session.capture_meta.get("actual_fps") or session.capture_meta.get("fps") or 0.0)
+        capture_degraded = bool(
+            session.self_evolution_recording_enabled
+            and (
+                (actual_width > 0 and actual_width != int(self.cfg.target_width))
+                or (actual_height > 0 and actual_height != int(self.cfg.target_height))
+                or (actual_fps > 0 and abs(actual_fps - float(self.cfg.target_fps)) > 0.5)
+            )
+        )
+        meta = {
+            "session_id": session.session_id,
+            "case_id": session.case_id,
+            "created_at": session.created_at,
+            "updated_at": utc_now_iso(),
+            "state": session.state,
+            "section_idx": session.section_idx,
+            "step_idx": session.step_idx,
+            "started": session.started,
+            "ended_at": session.ended_at,
+            "mode": self.cfg.mode,
+            "self_evolution_recording_enabled": session.self_evolution_recording_enabled,
+            "target_width": int(self.cfg.target_width),
+            "target_height": int(self.cfg.target_height),
+            "target_fps": float(self.cfg.target_fps),
+            "actual_width": actual_width,
+            "actual_height": actual_height,
+            "actual_fps": actual_fps,
+            "capture_degraded": capture_degraded,
+            "degrade_reason": str(session.capture_meta.get("degrade_reason") or ("actual_capture_differs_from_target" if capture_degraded else "")),
+            "capture_meta": session.capture_meta,
+            "raw_media_path": session.raw_media_path,
+            "raw_audio_path": session.raw_audio_path,
+            "raw_video_path": session.raw_video_path,
+            "review_media_path": session.review_media_path,
+            "review_media_error": session.review_media_error,
+            "recorded_frame_count": session.recorded_frame_count,
+            "runtime_config": {
+                "ip_webcam_url": self.cfg.ip_webcam_url,
+                "strategy_version": self.cfg.strategy_version,
+                "strategy_path": str(self.strategy_path),
+                "error_library": self.cfg.error_library,
+                "loaded_error_count": sum(len(v) for v in self.error_plans_by_step.values()),
+                "realtime_yolo_fps": self.cfg.realtime_yolo_fps,
+                "realtime_capture_fps": self.cfg.capture_fps,
+                "realtime_render_fps": self.cfg.render_fps,
+                "realtime_stream_fps": self.cfg.stream_fps,
+                "box_max_stale_ms": self.cfg.box_max_stale_ms,
+                "omni_section_pass_threshold": self.cfg.omni_section_pass_threshold,
+                "skip_omni_validation": self.cfg.skip_omni_validation,
+                "omni_model": self.cfg.omni_model,
+                "yolo_conf": self.cfg.yolo_conf,
+                "yolo_iou": self.cfg.yolo_iou,
+                "yolo_device": self.cfg.yolo_device,
+                "persist_max_miss_seconds": self.cfg.persist_max_miss_seconds,
+                "persist_max_miss_samples": self.cfg.persist_max_miss_samples,
+                "ingest_video_path": self.cfg.ingest_video_path,
+            },
+        }
+        write_json(self._session_meta_path(session), meta)
+        if session.self_evolution_recording_enabled:
+            self._prepare_self_evolution_session(session)
+            write_json(self._self_evolution_session_meta_path(session), meta)
 
     def _write_session_meta_if_due(self, session: SessionState, force: bool = False) -> None:
         now = time.time()
@@ -624,42 +883,45 @@ class RealtimeTutorEngine:
         session.last_meta_write_ts = now
 
     def _log_event(self, session: SessionState, event: str, payload: Dict[str, Any]) -> None:
-        append_jsonl(
-            self._events_path(session),
-            {
-                "ts": utc_now_iso(),
-                "event": event,
-                "session_id": session.session_id,
-                "section_idx": session.section_idx,
-                "step_idx": session.step_idx,
-                "state": session.state,
-                "payload": payload,
-            },
-        )
+        item = {
+            "ts": utc_now_iso(),
+            "elapsed_sec": self._session_elapsed_sec(session),
+            "event": event,
+            "session_id": session.session_id,
+            "section_idx": session.section_idx,
+            "step_idx": session.step_idx,
+            "state": session.state,
+            "payload": payload,
+        }
+        append_jsonl(self._events_path(session), item)
+        if session.self_evolution_recording_enabled:
+            append_jsonl(self._self_evolution_path(session, "events.jsonl"), item)
 
     def _log_trace(self, session: SessionState, payload: Dict[str, Any]) -> None:
-        append_jsonl(
-            self._trace_path(session),
-            {
-                "ts": utc_now_iso(),
-                "session_id": session.session_id,
-                "section_idx": session.section_idx,
-                "step_idx": session.step_idx,
-                "payload": payload,
-            },
-        )
+        item = {
+            "ts": utc_now_iso(),
+            "elapsed_sec": self._session_elapsed_sec(session),
+            "session_id": session.session_id,
+            "section_idx": session.section_idx,
+            "step_idx": session.step_idx,
+            "payload": payload,
+        }
+        append_jsonl(self._trace_path(session), item)
+        if session.self_evolution_recording_enabled:
+            append_jsonl(self._self_evolution_path(session, "step_trace.jsonl"), item)
 
     def _log_omni(self, session: SessionState, payload: Dict[str, Any]) -> None:
-        append_jsonl(
-            self._omni_path(session),
-            {
-                "ts": utc_now_iso(),
-                "session_id": session.session_id,
-                "section_idx": session.section_idx,
-                "step_idx": session.step_idx,
-                "payload": payload,
-            },
-        )
+        item = {
+            "ts": utc_now_iso(),
+            "elapsed_sec": self._session_elapsed_sec(session),
+            "session_id": session.session_id,
+            "section_idx": session.section_idx,
+            "step_idx": session.step_idx,
+            "payload": payload,
+        }
+        append_jsonl(self._omni_path(session), item)
+        if session.self_evolution_recording_enabled:
+            append_jsonl(self._self_evolution_path(session, "omni_calls.jsonl"), item)
 
     def _current_section(self, session: SessionState) -> Optional[SectionRuntime]:
         if session.section_idx < 0 or session.section_idx >= len(self.sections):
@@ -676,6 +938,40 @@ class RealtimeTutorEngine:
 
     def _load_step_plan(self, step_id: str) -> Dict[str, Any]:
         return read_json(ROOT / "data" / self.cfg.case_id / "v2" / "detector-plans" / f"{step_id}.json")
+
+    def _plan_object_targets(self, plan: Dict[str, Any]) -> List[str]:
+        targets = extract_object_targets_from_plan(plan)
+        global_by_norm = {normalize_name(t): t for t in self.global_targets}
+        for cond in plan.get("judgement_conditions", []) if isinstance(plan.get("judgement_conditions"), list) else []:
+            if not isinstance(cond, dict):
+                continue
+            code = str(cond.get("code", ""))
+            for quoted in re.findall(r"'([^']+)'", code):
+                key = normalize_name(quoted)
+                if key in global_by_norm and global_by_norm[key] not in targets:
+                    targets.append(global_by_norm[key])
+        for item in plan.get("object_targets", []) if isinstance(plan.get("object_targets"), list) else []:
+            target = str(item).strip()
+            if target and target not in targets:
+                targets.append(target)
+        return targets
+
+    def _error_plans_for_step(self, section_id: str, step_id: str) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        for plan in self.error_plans_by_step.get(step_id, []):
+            scope = plan.get("scope") if isinstance(plan.get("scope"), dict) else {}
+            applies_sections = {str(x).strip() for x in scope.get("applies_to_sections", []) if str(x).strip()}
+            applies_steps = {str(x).strip() for x in scope.get("applies_to_steps", []) if str(x).strip()}
+            not_sections = {str(x).strip() for x in scope.get("not_errors_in_sections", []) if str(x).strip()}
+            not_steps = {str(x).strip() for x in scope.get("not_errors_in_steps", []) if str(x).strip()}
+            if section_id in not_sections or step_id in not_steps:
+                continue
+            if applies_steps and step_id not in applies_steps:
+                continue
+            if applies_sections and section_id not in applies_sections:
+                continue
+            out.append(plan)
+        return out
 
     def _section_intro_payload(self, session: SessionState) -> Dict[str, Any]:
         sec = self._current_section(session)
@@ -718,7 +1014,20 @@ class RealtimeTutorEngine:
         self._reset_step_runtime(session)
         step = self._current_step(session)
         if step:
-            self._log_event(session, "step_start", {"step_id": step.get("step_id"), "step_order": step.get("step_order")})
+            prompt = (step.get("prompt") or {}) if isinstance(step, dict) else {}
+            payload = {
+                "step_id": step.get("step_id"),
+                "step_order": step.get("step_order"),
+                "section_id": sec.section_id if sec else None,
+                "start_sec": self._session_elapsed_sec(session),
+                "prompt": prompt,
+                "focus_points": step.get("focus_points", []),
+                "common_mistakes": step.get("common_mistakes", []),
+            }
+            self._log_event(session, "step_start", payload)
+            if session.self_evolution_recording_enabled:
+                append_jsonl(self._self_evolution_path(session, "system_prompts.jsonl"), payload)
+                append_jsonl(self._self_evolution_path(session, "step_trace.jsonl"), {**payload, "event": "step_start"})
 
     def _advance_state_machine(self, session: SessionState) -> None:
         now = time.time()
@@ -799,7 +1108,23 @@ class RealtimeTutorEngine:
         text, images = self._omni_validate_payload(session)
         step_ids = [str(s.get("step_id", "")) for s in sec.steps if str(s.get("step_id", ""))]
         result: Dict[str, Any]
-        if not self.api_key:
+        if self.cfg.skip_omni_validation:
+            result = {
+                "confidence": 1.0,
+                "pass": True,
+                "retry_step_id": None,
+                "reason": "omni_validation_skipped_by_config",
+            }
+            self._log_omni(
+                session,
+                {
+                    "mode": "skipped_by_config",
+                    "request_text": text,
+                    "images_count": len(images),
+                    "response": result,
+                },
+            )
+        elif not self.api_key:
             result = {
                 "confidence": 0.99,
                 "pass": True,
@@ -913,9 +1238,23 @@ class RealtimeTutorEngine:
                 self._log_event(session, "session_init", {})
             return self._snapshot(session)
 
-    def start_session(self, session_id: str) -> Dict[str, Any]:
+    def start_session(
+        self,
+        session_id: str,
+        self_evolution_recording_enabled: bool = False,
+        capture_meta: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         with self._lock:
             session = self.sessions[session_id]
+            session.self_evolution_recording_enabled = bool(self_evolution_recording_enabled)
+            session.capture_meta = capture_meta if isinstance(capture_meta, dict) else {}
+            session.started_at_monotonic = time.time()
+            session.ended_at = ""
+            session.review_media_path = ""
+            session.review_media_error = ""
+            if session.self_evolution_recording_enabled:
+                self._prepare_self_evolution_session(session)
+                self._start_ipcam_recording(session)
             session.started = True
             session.state = "chapter_intro"
             session.state_until = time.time() + 3.0
@@ -925,6 +1264,7 @@ class RealtimeTutorEngine:
             session.recent_frames.clear()
             session.last_eval = None
             session.last_omni = None
+            session.last_error = None
             session.last_overlay_detections = []
             session.last_overlay_object_targets = []
             session.last_overlay_step_id = ""
@@ -935,7 +1275,15 @@ class RealtimeTutorEngine:
             session.latest_annotated_jpg = b""
             self._reset_step_runtime(session)
             self._write_session_meta_if_due(session, force=True)
-            self._log_event(session, "session_start", {"section": self._section_intro_payload(session)})
+            self._log_event(
+                session,
+                "session_start",
+                {
+                    "section": self._section_intro_payload(session),
+                    "self_evolution_recording_enabled": session.self_evolution_recording_enabled,
+                    "capture_meta": session.capture_meta,
+                },
+            )
             return self._snapshot(session)
 
     def reset_session(self, session_id: str) -> Dict[str, Any]:
@@ -947,6 +1295,7 @@ class RealtimeTutorEngine:
         code = ""
         object_targets: List[str] = []
         disambiguation_targets: List[str] = []
+        error_plans: List[Dict[str, Any]] = []
         use_hand_model = False
         sample_seq = 0
         object_memory: Dict[str, Dict[str, Any]] = {}
@@ -982,6 +1331,8 @@ class RealtimeTutorEngine:
                         session.state = "course_done"
                     return self._snapshot(session)
                 step_id = str(step.get("step_id", ""))
+                sec = self._current_section(session)
+                section_id = sec.section_id if sec else ""
                 plan = self._load_step_plan(step_id)
                 code_items = plan.get("judgement_conditions", [])
                 code = str(code_items[0].get("code", "")).strip() if isinstance(code_items, list) and code_items else ""
@@ -989,9 +1340,20 @@ class RealtimeTutorEngine:
                     self._log_event(session, "step_error", {"step_id": step_id, "error": "empty_judgement_code"})
                     return self._snapshot(session)
 
-                object_targets = extract_object_targets_from_plan(plan)
+                object_targets = self._plan_object_targets(plan)
+                error_plans = self._error_plans_for_step(section_id, step_id)
+                for error_plan in error_plans:
+                    for target in self._plan_object_targets(error_plan):
+                        if target not in object_targets:
+                            object_targets.append(target)
                 disambiguation_targets = list(dict.fromkeys([*object_targets, *self.global_disambiguation_targets]))
-                use_hand_model = step_requires_hand_model(plan, code)
+                use_hand_model = step_requires_hand_model(plan, code) or any(
+                    step_requires_hand_model(
+                        ep,
+                        str(((ep.get("judgement_conditions") or [{}])[0] if isinstance(ep.get("judgement_conditions"), list) and ep.get("judgement_conditions") else {}).get("code", "")),
+                    )
+                    for ep in error_plans
+                )
                 sample_seq = session.step_sample_seq + 1
                 session.step_sample_seq = sample_seq
                 object_memory = copy.deepcopy(session.step_object_memory)
@@ -1045,11 +1407,34 @@ class RealtimeTutorEngine:
             yolo_detections=overlay_detections,
         )
         matched = eval_condition_code(code, ctx, hand_in_bbox_threshold=self.cfg.hand_in_bbox_threshold)
+        matched_error: Optional[Dict[str, Any]] = None
+        for error_plan in error_plans:
+            conds = error_plan.get("judgement_conditions", [])
+            err_code = str(conds[0].get("code", "")).strip() if isinstance(conds, list) and conds else ""
+            if not err_code:
+                continue
+            error_matched = eval_condition_code(err_code, ctx, hand_in_bbox_threshold=self.cfg.hand_in_bbox_threshold)
+            if not error_matched:
+                continue
+            correction = error_plan.get("correction_message") if isinstance(error_plan.get("correction_message"), dict) else {}
+            matched_error = {
+                "error_id": str(error_plan.get("error_id") or error_plan.get("slice_id") or ""),
+                "message": str(correction.get("zh") or correction.get("en") or ""),
+                "scope": error_plan.get("scope", {}),
+                "evidence": {
+                    "matched_condition": err_code,
+                    "confidence": 1.0,
+                    "detector_source": ctx.get("detector_source", "yolo"),
+                },
+            }
+            break
         filtered_detections = [d for d in overlay_detections if isinstance(d, dict)]
         trace_payload = {
             "step_id": step_id,
             "sample_seq": sample_seq,
             "matched": bool(matched),
+            "error_matched": bool(matched_error),
+            "last_error": matched_error,
             "objects": ctx.get("objects", {}),
             "hand_points": ctx.get("hand_points", {}),
             "detector_source": ctx.get("detector_source", "yolo"),
@@ -1083,7 +1468,13 @@ class RealtimeTutorEngine:
                 "detector_source": ctx.get("detector_source", "yolo"),
             }
 
-            if matched:
+            if matched_error:
+                session.last_error = matched_error
+                self._log_event(session, "known_error_detected", matched_error)
+            else:
+                session.last_error = None
+
+            if matched and not matched_error:
                 session.completed_steps.append(step_id)
                 session.state = "step_done_hold"
                 session.state_until = time.time() + 3.0
@@ -1176,6 +1567,32 @@ class RealtimeTutorEngine:
             self._log_event(session, "manual_next_section", {})
             return self._snapshot(session)
 
+    def force_next_step(self, session_id: str) -> Dict[str, Any]:
+        with self._lock:
+            session = self.sessions[session_id]
+            sec = self._current_section(session)
+            if sec is None:
+                return self._snapshot(session)
+            current_step = self._current_step(session)
+            current_step_id = str((current_step or {}).get("step_id", ""))
+            session.last_error = None
+            session.step_idx += 1
+            if session.step_idx >= len(sec.steps):
+                self._goto_next_section(session, reason="manual_next_step_at_section_end")
+            else:
+                self._start_step_running(session)
+            self._write_session_meta_if_due(session, force=True)
+            self._log_event(
+                session,
+                "manual_next_step",
+                {
+                    "from_step_id": current_step_id,
+                    "to_step_id": str((self._current_step(session) or {}).get("step_id", "")),
+                    "section_id": sec.section_id,
+                },
+            )
+            return self._snapshot(session)
+
     def retry_section(self, session_id: str) -> Dict[str, Any]:
         with self._lock:
             session = self.sessions[session_id]
@@ -1218,6 +1635,84 @@ class RealtimeTutorEngine:
                     lines = path.read_text(encoding="utf-8").splitlines()
                     out[name] = [json.loads(x) for x in lines if x.strip()]
             return out
+
+    def store_self_evolution_media(self, session_id: str, media_bytes: bytes, content_type: str) -> Dict[str, Any]:
+        with self._lock:
+            session = self.sessions[session_id]
+            if not session.self_evolution_recording_enabled:
+                return {"ok": False, "error": "self_evolution_recording_not_enabled", "session_id": session_id}
+            raw_dir = self._self_evolution_raw_dir(session)
+            raw_dir.mkdir(parents=True, exist_ok=True)
+            lower_type = (content_type or "").lower()
+            suffix = ".webm"
+            if "wav" in lower_type:
+                suffix = ".wav"
+            elif "mpeg" in lower_type or "mp3" in lower_type:
+                suffix = ".mp3"
+            path = raw_dir / f"teaching_audio{suffix}"
+            path.write_bytes(media_bytes)
+            session.raw_audio_path = str(path.relative_to(ROOT))
+            session.raw_media_path = session.raw_audio_path
+            session.ended_at = utc_now_iso()
+            self._log_event(
+                session,
+                "self_evolution_audio_uploaded",
+                {"path": session.raw_audio_path, "content_type": content_type, "bytes": len(media_bytes)},
+            )
+            self._write_session_meta_if_due(session, force=True)
+            return {
+                "ok": True,
+                "session_id": session_id,
+                "raw_audio_path": session.raw_audio_path,
+                "bytes": len(media_bytes),
+            }
+
+    def finish_self_evolution_session(self, session_id: str) -> Dict[str, Any]:
+        with self._lock:
+            session = self.sessions[session_id]
+            self._stop_ipcam_recording(session)
+            self._build_review_media(session)
+            session.ended_at = session.ended_at or utc_now_iso()
+            self._log_event(
+                session,
+                "self_evolution_session_finished",
+                {
+                    "auto_reflection_pending": True,
+                    "review_media_path": session.review_media_path,
+                    "review_media_error": session.review_media_error,
+                },
+            )
+            self._write_session_meta_if_due(session, force=True)
+            return {
+                "ok": True,
+                "session_id": session_id,
+                "self_evolution_recording_enabled": session.self_evolution_recording_enabled,
+                "raw_media_path": session.raw_media_path,
+                "raw_audio_path": session.raw_audio_path,
+                "raw_video_path": session.raw_video_path,
+                "review_media_path": session.review_media_path,
+                "review_media_error": session.review_media_error,
+                "recorded_frame_count": session.recorded_frame_count,
+            }
+
+    def discard_self_evolution_session(self, session_id: str) -> Dict[str, Any]:
+        with self._lock:
+            session = self.sessions.get(session_id)
+            if session is None:
+                return {"ok": True, "session_id": session_id, "discarded": False, "reason": "unknown_session"}
+            self._stop_ipcam_recording(session)
+            v5_dir = self._self_evolution_session_dir(session)
+            session.self_evolution_recording_enabled = False
+            session.capture_meta = {}
+            session.raw_media_path = ""
+            session.raw_audio_path = ""
+            session.raw_video_path = ""
+            session.review_media_path = ""
+            session.review_media_error = ""
+            session.ended_at = utc_now_iso()
+        if v5_dir.exists():
+            shutil.rmtree(v5_dir)
+        return {"ok": True, "session_id": session_id, "discarded": True, "deleted_path": str(v5_dir)}
 
     def _snapshot(self, session: SessionState) -> Dict[str, Any]:
         sec = self._current_section(session)
@@ -1267,7 +1762,29 @@ class RealtimeTutorEngine:
             },
             "last_eval": session.last_eval,
             "last_omni": session.last_omni,
+            "last_error": session.last_error,
             "is_done": is_done,
+            "self_evolution": {
+                "mode": self.cfg.mode,
+                "recording_enabled": session.self_evolution_recording_enabled,
+                "session_dir": str(self._self_evolution_session_dir(session).relative_to(ROOT)),
+                "raw_media_path": session.raw_media_path,
+                "raw_audio_path": session.raw_audio_path,
+                "raw_video_path": session.raw_video_path,
+                "review_media_path": session.review_media_path,
+                "review_media_error": session.review_media_error,
+                "video_source": "ipcam",
+                "audio_source": "browser_microphone",
+                "recorded_frame_count": session.recorded_frame_count,
+                "capture": {
+                    "target_width": int(self.cfg.target_width),
+                    "target_height": int(self.cfg.target_height),
+                    "target_fps": float(self.cfg.target_fps),
+                    "actual_width": int(session.capture_meta.get("actual_width") or session.capture_meta.get("width") or 0),
+                    "actual_height": int(session.capture_meta.get("actual_height") or session.capture_meta.get("height") or 0),
+                    "actual_fps": float(session.capture_meta.get("actual_fps") or session.capture_meta.get("fps") or 0.0),
+                },
+            },
             "config": {
                 "realtime_yolo_fps": self.cfg.realtime_yolo_fps,
                 "realtime_capture_fps": self.cfg.capture_fps,
@@ -1275,6 +1792,10 @@ class RealtimeTutorEngine:
                 "realtime_stream_fps": self.cfg.stream_fps,
                 "realtime_stream_max_width": self.cfg.stream_max_width,
                 "server_side_overlay_enabled": self.cfg.server_side_overlay_enabled,
+                "strategy_version": self.cfg.strategy_version,
+                "strategy_path": str(self.strategy_path),
+                "error_library": self.cfg.error_library,
+                "loaded_error_count": sum(len(v) for v in self.error_plans_by_step.values()),
                 "box_max_stale_ms": self.cfg.box_max_stale_ms,
                 "omni_section_pass_threshold": self.cfg.omni_section_pass_threshold,
                 "omni_model": self.cfg.omni_model,
@@ -1443,12 +1964,44 @@ class RealtimeHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
         path = parsed.path
+        if path == "/api/self-evolution/session/media":
+            qs = parse_qs(parsed.query)
+            sid = (qs.get("session_id", [""])[0] or self.headers.get("X-Session-Id", "")).strip()
+            if not sid:
+                return self._json(400, {"ok": False, "error": "missing session_id"})
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except Exception:
+                length = 0
+            if length <= 0:
+                return self._json(400, {"ok": False, "error": "empty_media_body"})
+            media = self.rfile.read(length)
+            try:
+                payload = self.engine.store_self_evolution_media(
+                    sid,
+                    media,
+                    self.headers.get("Content-Type", "application/octet-stream"),
+                )
+                return self._json(200 if payload.get("ok") else 400, payload)
+            except Exception as exc:
+                return self._json(500, {"ok": False, "error": str(exc)})
+
         body = self._read_json_body()
         sid = str(body.get("session_id", "")).strip()
 
         try:
             if path == "/api/realtime/session/start":
-                payload = self.engine.start_session(sid)
+                payload = self.engine.start_session(
+                    sid,
+                    self_evolution_recording_enabled=bool(body.get("self_evolution_recording_enabled", False)),
+                    capture_meta=body.get("capture_meta") if isinstance(body.get("capture_meta"), dict) else {},
+                )
+                return self._json(200, payload)
+            if path == "/api/self-evolution/session/finish":
+                payload = self.engine.finish_self_evolution_session(sid)
+                return self._json(200, payload)
+            if path == "/api/self-evolution/session/discard":
+                payload = self.engine.discard_self_evolution_session(sid)
                 return self._json(200, payload)
             if path == "/api/realtime/session/reset":
                 payload = self.engine.reset_session(sid)
@@ -1462,6 +2015,9 @@ class RealtimeHandler(BaseHTTPRequestHandler):
             if path == "/api/realtime/section/next":
                 payload = self.engine.force_next_section(sid)
                 return self._json(200, payload)
+            if path == "/api/realtime/step/next":
+                payload = self.engine.force_next_step(sid)
+                return self._json(200, payload)
             if path == "/api/realtime/section/retry":
                 payload = self.engine.retry_section(sid)
                 return self._json(200, payload)
@@ -1471,20 +2027,25 @@ class RealtimeHandler(BaseHTTPRequestHandler):
         self.send_error(404, "Not Found")
 
 
-def build_runtime_config(case_id: str) -> RuntimeConfig:
+def build_runtime_config(case_id: str, mode: str = "realtime", strategy_version: str = "base", error_library: str = "none") -> RuntimeConfig:
     realtime_yolo_fps = max(0.1, env_float("REALTIME_YOLO_FPS", RT_DEFAULT_YOLO_FPS))
+    ingest_meta = load_ingest_video_meta(case_id)
     persist_max_miss_seconds = max(
         0.1,
         env_float("REALTIME_PERSIST_MAX_MISS_SECONDS", RT_DEFAULT_PERSIST_MAX_MISS_SECONDS),
     )
     return RuntimeConfig(
         case_id=case_id,
+        mode=mode,
+        strategy_version=strategy_version,
+        error_library=error_library,
         ip_webcam_url=env_str("IP_WEBCAM_URL", RT_DEFAULT_IP_WEBCAM_URL),
         realtime_yolo_fps=realtime_yolo_fps,
         omni_section_pass_threshold=max(
             0.0,
             min(1.0, env_float("OMNI_SECTION_PASS_THRESHOLD", RT_DEFAULT_OMNI_SECTION_PASS_THRESHOLD)),
         ),
+        skip_omni_validation=env_bool("REALTIME_SKIP_OMNI_VALIDATION", RT_DEFAULT_SKIP_OMNI_VALIDATION),
         omni_model=env_str("OMNI_MODEL", RT_DEFAULT_OMNI_MODEL),
         omni_base_url=TA_BASE_URL,
         omni_timeout_sec=int(TA_REQUEST_TIMEOUT_SEC),
@@ -1507,6 +2068,10 @@ def build_runtime_config(case_id: str) -> RuntimeConfig:
             0.01,
             min(0.5, env_float("REALTIME_HAND_IN_BBOX_THRESHOLD", RT_DEFAULT_HAND_IN_BBOX_THRESHOLD)),
         ),
+        target_width=int(ingest_meta["target_width"]),
+        target_height=int(ingest_meta["target_height"]),
+        target_fps=float(ingest_meta["target_fps"]),
+        ingest_video_path=str(ingest_meta["ingest_video_path"]),
     )
 
 
@@ -1515,21 +2080,36 @@ def main() -> None:
     parser.add_argument("--case-id", default="test_cake")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8787)
+    parser.add_argument("--mode", choices=["realtime", "self-evolution"], default="realtime")
+    parser.add_argument("--strategy-version", choices=["base", "evolved"], default="base")
+    parser.add_argument("--error-library", choices=["none", "v5"], default="none")
     args = parser.parse_args()
 
-    cfg = build_runtime_config(args.case_id)
+    cfg = build_runtime_config(
+        args.case_id,
+        mode=args.mode,
+        strategy_version=args.strategy_version,
+        error_library=args.error_library,
+    )
     engine = RealtimeTutorEngine(cfg)
     RealtimeHandler.engine = engine
     server = ThreadingHTTPServer((args.host, int(args.port)), RealtimeHandler)
     print(f"[INFO] realtime tutor server: http://{args.host}:{args.port}")
     print(
-        f"[INFO] case={args.case_id} webcam={cfg.ip_webcam_url} "
+        f"[INFO] case={args.case_id} mode={cfg.mode} strategy_version={cfg.strategy_version} "
+        f"error_library={cfg.error_library} webcam={cfg.ip_webcam_url} "
         f"capture_fps={cfg.capture_fps} yolo_fps={cfg.realtime_yolo_fps} "
         f"render_fps={cfg.render_fps} stream_fps={cfg.stream_fps} "
         f"stream_max_width={cfg.stream_max_width} "
         f"server_side_overlay_enabled={cfg.server_side_overlay_enabled}"
     )
-    print(f"[INFO] omni_model={cfg.omni_model} threshold={cfg.omni_section_pass_threshold}")
+    print(
+        f"[INFO] omni_model={cfg.omni_model} threshold={cfg.omni_section_pass_threshold} "
+        f"skip_omni_validation={cfg.skip_omni_validation}"
+    )
+    print(f"[INFO] self_evolution_target={cfg.target_width}x{cfg.target_height}@{cfg.target_fps}fps")
+    print(f"[INFO] strategy_path={engine.strategy_path}")
+    print(f"[INFO] loaded_error_count={sum(len(v) for v in engine.error_plans_by_step.values())}")
     server.serve_forever()
 
 

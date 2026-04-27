@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://insitututor.local/schemas/error_event_v1.schema.json",
+  "title": "ErrorEventV1",
+  "type": "object",
+  "required": ["error_id", "session_id", "error_name", "scope", "time_range_sec", "student_wrong_action", "why_wrong_in_scope", "correction_message", "confidence"],
+  "properties": {
+    "error_id": { "type": "string", "minLength": 1 },
+    "session_id": { "type": "string", "minLength": 1 },
+    "error_name": { "type": "string" },
+    "scope": { "$ref": "learning_event_v1.schema.json#/$defs/scope" },
+    "time_range_sec": { "$ref": "learning_event_v1.schema.json#/$defs/time_range_sec" },
+    "teacher_intervention": { "type": "object" },
+    "error_cause_type": {
+      "type": "string",
+      "enum": [
+        "object_identity_confusion",
+        "wrong_object_selection",
+        "wrong_spatial_relation",
+        "wrong_orientation",
+        "wrong_sequence",
+        "wrong_hand_action",
+        "insufficient_action",
+        "other"
+      ]
+    },
+    "confused_entities": {
+      "type": "object",
+      "properties": {
+        "student_used_or_pointed_to": { "type": "string" },
+        "should_have_used_or_recognized": { "type": "string" },
+        "evidence_utterance": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+    "student_wrong_action": { "type": "string" },
+    "why_wrong_in_scope": { "type": "string" },
+    "correction_message": {
+      "type": "object",
+      "properties": {
+        "zh": { "type": "string" },
+        "en": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+    "error_slice_path": { "type": "string" },
+    "detector_plan_ref": { "type": "string" },
+    "confidence": { "type": "number", "minimum": 0, "maximum": 1 }
+  },
+  "additionalProperties": true
+}

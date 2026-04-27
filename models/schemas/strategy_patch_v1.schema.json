@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://insitututor.local/schemas/strategy_patch_v1.schema.json",
+  "title": "StrategyPatchV1",
+  "type": "object",
+  "required": ["base_strategy_ref", "patches"],
+  "properties": {
+    "base_strategy_ref": { "type": "string" },
+    "patches": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["patch_id", "source_event_type", "source_event_id", "operation", "target", "new_value", "reason", "confidence"],
+        "properties": {
+          "patch_id": { "type": "string" },
+          "source_event_type": { "type": "string", "enum": ["confusion", "error"] },
+          "source_event_id": { "type": "string" },
+          "operation": { "type": "string", "enum": ["replace", "append"] },
+          "target": {
+            "type": "object",
+            "required": ["section_id", "step_id", "field"],
+            "properties": {
+              "section_id": { "type": "string" },
+              "step_id": { "type": "string" },
+              "field": {
+                "type": "string",
+                "enum": ["prompt.zh", "prompt.en", "focus_points", "common_mistakes"]
+              }
+            },
+            "additionalProperties": false
+          },
+          "old_value": {},
+          "new_value": {},
+          "reason": { "type": "string" },
+          "confidence": { "type": "number", "minimum": 0, "maximum": 1 }
+        },
+        "additionalProperties": true
+      }
+    }
+  },
+  "additionalProperties": true
+}

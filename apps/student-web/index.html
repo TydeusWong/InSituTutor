@@ -38,6 +38,12 @@
           <ul id="mistake-list" class="small-list"></ul>
         </div>
 
+        <div id="error-correction" class="error-correction hidden">
+          <div class="error-title">Correction</div>
+          <div id="error-message" class="error-message"></div>
+          <div id="error-evidence" class="error-evidence"></div>
+        </div>
+
         <div class="metrics">
           <div>章节：<span id="section-progress">-</span></div>
           <div>步骤：<span id="step-progress">-</span></div>
@@ -45,8 +51,18 @@
           <div>Omni：<span id="omni-result">-</span></div>
         </div>
 
+        <div class="recording-controls">
+          <label class="record-toggle">
+            <input id="self-evolution-recording" type="checkbox" />
+            <span>Self-evolution recording</span>
+          </label>
+          <div id="recording-status" class="recording-status">Recording off</div>
+          <div id="recording-meta" class="recording-meta">Video: IP camera | Audio: microphone | Target: -</div>
+        </div>
+
         <div class="actions">
           <button id="btn-start" class="btn primary">开始会话</button>
+          <button id="btn-next-step" class="btn warning">下一步骤</button>
           <button id="btn-next" class="btn warning">下一章节</button>
           <button id="btn-retry" class="btn">重试本章</button>
           <button id="btn-reset" class="btn success">重新开始</button>

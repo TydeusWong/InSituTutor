@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://insitututor.local/schemas/confusion_event_v1.schema.json",
+  "title": "ConfusionEventV1",
+  "type": "object",
+  "required": ["confusion_id", "session_id", "scope", "student_question_original", "student_question_time_range_sec", "confusion_reason", "confidence"],
+  "properties": {
+    "confusion_id": { "type": "string", "minLength": 1 },
+    "session_id": { "type": "string", "minLength": 1 },
+    "scope": { "$ref": "learning_event_v1.schema.json#/$defs/scope" },
+    "student_question_original": { "type": "string" },
+    "student_question_time_range_sec": { "$ref": "learning_event_v1.schema.json#/$defs/time_range_sec" },
+    "related_system_prompt": { "type": "object" },
+    "video_context": { "type": "string" },
+    "confusion_reason": { "type": "string" },
+    "strategy_patch_proposal": { "type": "object" },
+    "confidence": { "type": "number", "minimum": 0, "maximum": 1 }
+  },
+  "additionalProperties": true
+}

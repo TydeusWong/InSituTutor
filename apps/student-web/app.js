@@ -9,6 +9,15 @@ const state = {
   overlayData: null,
   drawQueued: false,
   resizeObserver: null,
+  selfEvolutionRecordingEnabled: false,
+  mediaRecorder: null,
+  mediaStream: null,
+  recordedChunks: [],
+  recordingStarted: false,
+  mediaUploaded: false,
+  recordingDiscarded: false,
+  captureTarget: null,
+  captureActual: null,
 };
 
 const el = {
@@ -26,7 +35,14 @@ const el = {
   videoFeed: document.getElementById("video-feed"),
   videoOverlay: document.getElementById("video-overlay"),
   serverMessage: document.getElementById("server-message"),
+  errorCorrection: document.getElementById("error-correction"),
+  errorMessage: document.getElementById("error-message"),
+  errorEvidence: document.getElementById("error-evidence"),
+  selfEvolutionRecording: document.getElementById("self-evolution-recording"),
+  recordingStatus: document.getElementById("recording-status"),
+  recordingMeta: document.getElementById("recording-meta"),
   btnStart: document.getElementById("btn-start"),
+  btnNextStep: document.getElementById("btn-next-step"),
   btnNext: document.getElementById("btn-next"),
   btnRetry: document.getElementById("btn-retry"),
   btnReset: document.getElementById("btn-reset"),
@@ -157,11 +173,15 @@ function render(snapshot) {
   el.stepProgress.textContent = `${(step.index ?? 0) + 1}/${step.count ?? 0}`;
   el.detectorSource.textContent = lastEval.detector_source || "-";
   if (typeof lastOmni.confidence === "number") {
-    el.omniResult.textContent = `${lastOmni.pass ? "PASS" : "RETRY"} (${lastOmni.confidence.toFixed(3)})`;
+    const skipped = String(lastOmni.reason || "").includes("omni_validation_skipped");
+    const status = skipped ? "SKIPPED/PASS" : (lastOmni.pass ? "PASS" : "RETRY");
+    el.omniResult.textContent = `${status} (${lastOmni.confidence.toFixed(3)})`;
   } else {
     el.omniResult.textContent = "-";
   }
   el.serverMessage.textContent = snapshot.message || "";
+  renderErrorCorrection(snapshot.last_error || null);
+  renderRecordingState(snapshot);
 
   const videoUrl = snapshot.video_primary_url || snapshot.video_feed_url || snapshot.video_feed_stream_url || snapshot.video_feed_overlay_url;
   if (videoUrl && el.videoFeed.dataset.streamUrl !== videoUrl) {
@@ -177,6 +197,63 @@ function render(snapshot) {
     state.overlayData = null;
     stopLoop();
     requestOverlayDraw();
+    finalizeSelfEvolutionRecording().catch((err) => {
+      el.serverMessage.textContent = `Recording upload failed: ${err.message}`;
+    });
+  }
+}
+
+function renderErrorCorrection(lastError) {
+  if (!el.errorCorrection || !el.errorMessage || !el.errorEvidence) return;
+  if (!lastError || !lastError.error_id) {
+    el.errorCorrection.classList.add("hidden");
+    el.errorMessage.textContent = "";
+    el.errorEvidence.textContent = "";
+    el.stepPrompt.classList.remove("step-prompt-error");
+    return;
+  }
+  const evidence = lastError.evidence || {};
+  el.errorCorrection.classList.remove("hidden");
+  el.errorMessage.textContent = lastError.message || "Please correct the current action before continuing.";
+  el.errorEvidence.textContent = `${lastError.error_id} | ${evidence.detector_source || "detector"} | ${evidence.matched_condition || ""}`;
+  el.stepPrompt.classList.add("step-prompt-error");
+}
+
+function renderRecordingState(snapshot) {
+  const se = (snapshot && snapshot.self_evolution) || {};
+  const capture = se.capture || {};
+  if (capture.target_width && capture.target_height) {
+    state.captureTarget = {
+      width: Number(capture.target_width || 0),
+      height: Number(capture.target_height || 0),
+      fps: Number(capture.target_fps || 0),
+    };
+  }
+  const target = state.captureTarget;
+  const actual = state.captureActual || {
+    width: Number(capture.actual_width || 0),
+    height: Number(capture.actual_height || 0),
+    fps: Number(capture.actual_fps || 0),
+  };
+  const targetText = target && target.width
+    ? `Target: ${target.width}x${target.height}@${target.fps || "-"}fps`
+    : "Target: -";
+  const actualText = actual && actual.width
+    ? `Actual: ${actual.width}x${actual.height}@${actual.fps || "-"}fps`
+    : "Actual: -";
+  el.recordingMeta.textContent = `Video: IP camera | Audio: microphone | ${targetText} | ${actualText}`;
+  if (state.recordingStarted) {
+    el.recordingStatus.textContent = `Recording session ${state.sessionId || "-"}`;
+    el.recordingStatus.classList.add("active");
+  } else if (state.mediaUploaded) {
+    el.recordingStatus.textContent = "Recording uploaded";
+    el.recordingStatus.classList.remove("active");
+  } else if (state.recordingDiscarded) {
+    el.recordingStatus.textContent = "Recording discarded";
+    el.recordingStatus.classList.remove("active");
+  } else {
+    el.recordingStatus.textContent = state.selfEvolutionRecordingEnabled ? "Recording armed" : "Recording off";
+    el.recordingStatus.classList.toggle("active", state.selfEvolutionRecordingEnabled);
   }
 }
 
@@ -200,16 +277,131 @@ async function initSession() {
   render(data);
 }
 
+function getPreferredMimeType() {
+  const candidates = [
+    "video/webm;codecs=vp9,opus",
+    "video/webm;codecs=vp8,opus",
+    "video/webm",
+  ];
+  return candidates.find((x) => window.MediaRecorder && MediaRecorder.isTypeSupported(x)) || "";
+}
+
+async function startSelfEvolutionRecording() {
+  state.recordedChunks = [];
+  state.mediaUploaded = false;
+  state.recordingDiscarded = false;
+  const target = state.captureTarget || { width: 1280, height: 720, fps: 10 };
+  const constraints = { audio: true, video: false };
+  const stream = await navigator.mediaDevices.getUserMedia(constraints);
+  state.mediaStream = stream;
+  const audioTrack = stream.getAudioTracks()[0];
+  const settings = audioTrack ? audioTrack.getSettings() : {};
+  state.captureActual = {
+    actual_width: target.width || 0,
+    actual_height: target.height || 0,
+    actual_fps: target.fps || 0,
+    audio_sample_rate: Number(settings.sampleRate || 0),
+    audio_channel_count: Number(settings.channelCount || 0),
+    video_source: "ipcam",
+    audio_source: "browser_microphone",
+  };
+  const mimeType = getPreferredMimeType();
+  const options = mimeType ? { mimeType } : {};
+  const recorder = new MediaRecorder(stream, options);
+  recorder.addEventListener("dataavailable", (event) => {
+    if (event.data && event.data.size > 0) {
+      state.recordedChunks.push(event.data);
+    }
+  });
+  recorder.start(1000);
+  state.mediaRecorder = recorder;
+  state.recordingStarted = true;
+  renderRecordingState({});
+}
+
+async function uploadSelfEvolutionRecording() {
+  if (!state.selfEvolutionRecordingEnabled || state.mediaUploaded || !state.recordedChunks.length) return;
+  const mimeType = (state.mediaRecorder && state.mediaRecorder.mimeType) || "video/webm";
+  const blob = new Blob(state.recordedChunks, { type: mimeType });
+  const resp = await fetch(`/api/self-evolution/session/media?session_id=${encodeURIComponent(state.sessionId)}`, {
+    method: "POST",
+    headers: { "Content-Type": mimeType, "X-Session-Id": state.sessionId || "" },
+    body: blob,
+  });
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`HTTP ${resp.status}: ${text}`);
+  }
+  await resp.json();
+  const finishData = await api("/api/self-evolution/session/finish", "POST", { session_id: state.sessionId });
+  state.mediaUploaded = true;
+  state.recordedChunks = [];
+  if (finishData.review_media_path) {
+    el.serverMessage.textContent = `Review media saved: ${finishData.review_media_path}`;
+  } else if (finishData.review_media_error) {
+    el.serverMessage.textContent = `Review media mux failed: ${finishData.review_media_error}`;
+  }
+  renderRecordingState({});
+}
+
+async function finalizeSelfEvolutionRecording() {
+  if (!state.selfEvolutionRecordingEnabled || !state.recordingStarted) return;
+  const recorder = state.mediaRecorder;
+  if (recorder && recorder.state !== "inactive") {
+    await new Promise((resolve) => {
+      recorder.addEventListener("stop", resolve, { once: true });
+      recorder.stop();
+    });
+  }
+  if (state.mediaStream) {
+    state.mediaStream.getTracks().forEach((track) => track.stop());
+  }
+  state.recordingStarted = false;
+  state.mediaRecorder = null;
+  state.mediaStream = null;
+  const keep = window.confirm("是否保留本次 Self-evolution recording 数据？选择“取消”会舍弃本次录音录像和 v5 session 数据。");
+  if (keep) {
+    await uploadSelfEvolutionRecording();
+    return;
+  }
+  state.recordedChunks = [];
+  state.recordingDiscarded = true;
+  await api("/api/self-evolution/session/discard", "POST", { session_id: state.sessionId }).catch(() => {});
+  renderRecordingState({});
+}
+
 async function startSession() {
-  const data = await api("/api/realtime/session/start", "POST", { session_id: state.sessionId });
-  render(data);
-  state.running = true;
-  startLoop();
+  state.selfEvolutionRecordingEnabled = Boolean(el.selfEvolutionRecording && el.selfEvolutionRecording.checked);
+  try {
+    if (state.selfEvolutionRecordingEnabled) {
+      await startSelfEvolutionRecording();
+    }
+    const data = await api("/api/realtime/session/start", "POST", {
+      session_id: state.sessionId,
+      self_evolution_recording_enabled: state.selfEvolutionRecordingEnabled,
+      capture_meta: state.captureActual || {},
+    });
+    render(data);
+    state.running = true;
+    startLoop();
+  } catch (err) {
+    if (state.recordingStarted) {
+      await finalizeSelfEvolutionRecording().catch(() => {});
+    }
+    el.serverMessage.textContent = `Start failed: ${err.message}`;
+  }
 }
 
 async function nextSection() {
   const data = await api("/api/realtime/section/next", "POST", { session_id: state.sessionId });
   render(data);
+}
+
+async function nextStep() {
+  const data = await api("/api/realtime/step/next", "POST", { session_id: state.sessionId });
+  render(data);
+  state.running = true;
+  startLoop();
 }
 
 async function retrySection() {
@@ -276,9 +468,16 @@ function stopLoop() {
 }
 
 el.btnStart.addEventListener("click", startSession);
+el.btnNextStep.addEventListener("click", nextStep);
 el.btnNext.addEventListener("click", nextSection);
 el.btnRetry.addEventListener("click", retrySection);
 el.btnReset.addEventListener("click", resetSession);
+if (el.selfEvolutionRecording) {
+  el.selfEvolutionRecording.addEventListener("change", () => {
+    state.selfEvolutionRecordingEnabled = Boolean(el.selfEvolutionRecording.checked);
+    renderRecordingState({});
+  });
+}
 
 attachOverlayObservers();
 

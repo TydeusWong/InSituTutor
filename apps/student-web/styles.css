@@ -106,6 +106,44 @@ body {
   margin-bottom: 10px;
 }
 
+.step-prompt.step-prompt-error {
+  color: #9f1d1d;
+}
+
+.error-correction {
+  margin-top: 14px;
+  padding: 12px;
+  border: 1px solid #f0b4b4;
+  border-left: 5px solid #d72638;
+  border-radius: 8px;
+  background: #fff5f5;
+}
+
+.error-correction.hidden {
+  display: none;
+}
+
+.error-title {
+  font-family: "Space Grotesk", sans-serif;
+  font-weight: 700;
+  color: #b4232e;
+  margin-bottom: 6px;
+}
+
+.error-message {
+  font-size: 18px;
+  font-weight: 800;
+  line-height: 1.35;
+  color: #7f1d1d;
+}
+
+.error-evidence {
+  margin-top: 6px;
+  color: #7a3b3b;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
 .small-title {
   font-size: 13px;
   color: var(--muted);
@@ -124,6 +162,33 @@ body {
   grid-template-columns: 1fr 1fr;
   row-gap: 8px;
   color: #334865;
+}
+
+.recording-controls {
+  margin-top: 14px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #f8fbff;
+}
+
+.record-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 700;
+}
+
+.recording-status,
+.recording-meta {
+  margin-top: 6px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.recording-status.active {
+  color: var(--ok);
+  font-weight: 700;
 }
 
 .actions {
